@@ -1,132 +1,194 @@
 #include <Arduino.h>
 #include <EasyNextionLibrary.h>
+
 extern "C" {
   #include "biosignals.h"
 }
 
-// ---------- Nextion ----------
+// ---------- Configuración de Hardware y Nextion ----------
 #define BAUD_NEXTION 115200
-#define ID_WAVE_ECG 8   // ID del Waveform de ECG en Nextion
-#define ID_WAVE_PPG 7   // ID del Waveform de PPG en Nextion
-#define CANAL 0
-#define ALTURA_WAVE 200 // Rango vertical del Waveform (0 a 199 px)
-#define RX1_PIN 16
-#define TX1_PIN 17
+#define ID_WAVE_ECG  8
+#define ID_WAVE_PPG  7
+#define CANAL        0
+#define ALTURA_WAVE  200
 
-// ---------- ADC ----------
-const int PIN_ECG = 34; // Salida analógica del AD8232 (o similar)
-const int PIN_PPG = 35; // Sensor PPG
-
-// ---------- Temporización ----------
-const unsigned long PERIODO_GRAFICA = 20;       // 20 ms = 50 Hz, refresco visual
-const unsigned long PERIODO_INDICADORES = 1000; // 1 Hz, campos numéricos
-
-// Frecuencia de muestreo REAL para ambos detectores (ECG y PPG comparten timer)
+const int PIN_ECG = 34;
+const int PIN_PPG = 35;
 #define FS_DETECTOR 250.0f
 
-EasyNex myNextion(Serial);
-PanTompkins pt;   // detector de QRS (ECG)
-PPGDetector ppg;  // detector de pulso (PPG)
+// ---------- Estructuras de Datos para Colas ----------
+struct MuestraDual {
+  float ecg;
+  float ppg;
+  uint32_t timestamp_us;
+  uint16_t crudoECG;
+  uint16_t crudoPPG;
+};
 
-unsigned long tgrafica = 0;
-unsigned long tindicadores = 0;
+struct SignosVitales {
+  int fc;
+  int fp;
+  int spo2;
+};
 
-// ---- Muestreo por timer: la ISR solo marca bandera + timestamp preciso ----
-// (NO se hace analogRead dentro de la ISR: no es seguro en ESP32)
+// ---------- Handles de FreeRTOS ----------
+TaskHandle_t hTareaAdq = NULL;
+QueueHandle_t colaMuestras; // Tarea Adq -> Tarea Proc
+QueueHandle_t colaGrafica;  // Tarea Adq -> Tarea Display
+QueueHandle_t buzonSignos;  // Tarea Proc -> Tarea Display (Mailbox de tamaño 1)
+
 hw_timer_t *timerMuestreo = NULL;
-portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED;
-volatile bool banderaMuestra = false;
-volatile uint32_t tsMuestra_us = 0;
+EasyNex myNextion(Serial);
 
+// ---------- ISR del Timer de Hardware ----------
 void IRAM_ATTR onTimerMuestreo() {
-  portENTER_CRITICAL_ISR(&timerMux);
-  tsMuestra_us = micros(); // instante exacto de la interrupción (preciso)
-  banderaMuestra = true;
-  portEXIT_CRITICAL_ISR(&timerMux);
+  BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+  // Notifica a la tarea de adquisición de prioridad alta para que despierte de inmediato
+  vTaskNotifyGiveFromISR(hTareaAdq, &xHigherPriorityTaskWoken);
+  if (xHigherPriorityTaskWoken) {
+    portYIELD_FROM_ISR();
+  }
 }
 
+// Auxiliar para enviar comandos puros a Nextion
 void agregarPuntoGrafica(int idWave, int canal, int valor) {
-  Serial1.print("add ");
-  Serial1.print(idWave);
-  Serial1.print(",");
-  Serial1.print(canal);
-  Serial1.print(",");
-  Serial1.print(valor);
-  Serial1.write(0xFF);
-  Serial1.write(0xFF);
-  Serial1.write(0xFF);
+  Serial.print("add ");
+  Serial.print(idWave);
+  Serial.print(",");
+  Serial.print(canal);
+  Serial.print(",");
+  Serial.print(valor);
+  Serial.write(0xFF);
+  Serial.write(0xFF);
+  Serial.write(0xFF);
 }
 
-void setup() {
-  Serial.begin(115200); // debug, libre (Nextion usa Serial1)
+// =========================================================================
+// Tarea 1: Adquisición de Datos (Core 1 - Prioridad 5)
+// =========================================================================
+void tareaAdquisicion(void *pvParameters) {
+  for (;;) {
+    // Espera la notificación del Timer de Hardware (exactamente a 250 Hz)
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
-  myNextion.begin(BAUD_NEXTION);
-  // Serial1.begin(BAUD_NEXTION, SERIAL_8N1, RX1_PIN, TX1_PIN); // reconfigura DESPUÉS de myNextion.begin()
+    MuestraDual m;
+    m.timestamp_us = micros();
+    m.crudoECG = analogRead(PIN_ECG);
+    m.crudoPPG = analogRead(PIN_PPG);
+    m.ecg = (float)m.crudoECG - 2048.0f;
+    m.ppg = (float)m.crudoPPG - 2048.0f;
+
+    // Enviar muestra a la tarea de procesamiento
+    xQueueSendToBack(colaMuestras, &m, 0);
+
+    // Enviar a la cola gráfica descartando muestras antiguas si se llena
+    xQueueSendToBack(colaGrafica, &m, 0);
+  }
+}
+
+// =========================================================================
+// Tarea 2: Procesamiento de Señales / Algoritmos (Core 1 - Prioridad 4)
+// =========================================================================
+void tareaProcesamiento(void *pvParameters) {
+  PanTompkins pt;
+  PPGDetector ppg;
+  
+  pt_init(&pt, FS_DETECTOR);
+  ppg_init(&ppg, FS_DETECTOR);
+
+  MuestraDual m;
+  TickType_t ultActualizacionUI = xTaskGetTickCount();
+
+  for (;;) {
+    // Bloqueado hasta recibir una nueva muestra desde la cola
+    if (xQueueReceive(colaMuestras, &m, portMAX_DELAY) == pdTRUE) {
+      pt_process_t(&pt, m.ecg, m.timestamp_us);
+      ppg_process_t(&ppg, m.ppg, m.timestamp_us);
+    }
+
+    // Actualizar el Mailbox de signos vitales cada 1 segundo (1000 ms)
+    if ((xTaskGetTickCount() - ultActualizacionUI) >= pdMS_TO_TICKS(1000)) {
+      ultActualizacionUI = xTaskGetTickCount();
+
+      float bpmECG = pt_bpm(&pt);
+      float bpmPPG = ppg_bpm(&ppg);
+
+      SignosVitales sv;
+      sv.fc = (bpmECG > 0.0f) ? (int)(bpmECG + 0.5f) : 0;
+      sv.fp = (bpmPPG > 0.0f) ? (int)(bpmPPG + 0.5f) : 0;
+      sv.spo2 = 0; 
+
+      // Sobrescribir siempre con el último dato calculado (Mailbox)
+      xQueueOverwrite(buzonSignos, &sv);
+    }
+  }
+}
+
+// =========================================================================
+// Tarea 3: Gestión de Pantalla y UI Nextion (Core 0 - Prioridad 2)
+// =========================================================================
+void tareaDisplay(void *pvParameters) {
+  MuestraDual m;
+  SignosVitales sv;
+
+  for (;;) {
+    // Escuchar eventos de la pantalla
+    myNextion.NextionListen();
+
+    // 1. Dibujar gráficos en la Nextion si hay datos en la cola
+    while (xQueueReceive(colaGrafica, &m, 0) == pdTRUE) {
+      uint8_t valorECG = map(m.crudoECG, 0, 4095, 0, ALTURA_WAVE - 1);
+      uint8_t valorPPG = map(m.crudoPPG, 0, 4095, 0, ALTURA_WAVE - 1);
+
+      agregarPuntoGrafica(ID_WAVE_ECG, CANAL, valorECG);
+      agregarPuntoGrafica(ID_WAVE_PPG, CANAL, valorPPG);
+    }
+
+    // 2. Leer los signos vitales actualizados si existen en el buzón
+    if (xQueueReceive(buzonSignos, &sv, 0) == pdTRUE) {
+      myNextion.writeNum("n0.val", sv.fc);
+      myNextion.writeNum("n1.val", sv.spo2);
+      myNextion.writeNum("n2.val", sv.fp);
+    }
+
+    // Liberar la CPU del Core 0 un instante (20 ms ≈ refresco de 50 Hz para la pantalla)
+    vTaskDelay(pdMS_TO_TICKS(20));
+  }
+}
+
+// =========================================================================
+// Setup & Loop
+// =========================================================================
+void setup() {
+  Serial.begin(115200);
 
   analogReadResolution(12);
   analogSetAttenuation(ADC_11db);
 
-  pt_init(&pt, FS_DETECTOR);
-  ppg_init(&ppg, FS_DETECTOR);
+  myNextion.begin(BAUD_NEXTION);
 
-  // Un solo timer a FS_DETECTOR Hz, compartido por ambas señales.
-  // Prescaler 80 sobre clock de 80MHz -> 1 tick = 1us
+  // Crear colas y buzones
+  colaMuestras = xQueueCreate(64, sizeof(MuestraDual));  // Buffer para ráfagas de procesamiento
+  colaGrafica  = xQueueCreate(32, sizeof(MuestraDual));  // Buffer para la gráfica visual
+  buzonSignos  = xQueueCreate(1, sizeof(SignosVitales)); // Mailbox para mantener el último valor
+
+  assert(colaMuestras && colaGrafica && buzonSignos);
+
+  // Crear tareas asignando prioridades y núcleos según la arquitectura propuesta
+  xTaskCreatePinnedToCore(tareaAdquisicion,  "Adquisicion",   4096, NULL, 5, &hTareaAdq, 1); // Core 1 (Tiempo Real)
+  xTaskCreatePinnedToCore(tareaProcesamiento, "Procesamiento", 8192, NULL, 4, NULL,       1); // Core 1 (DSP / Algoritmos)
+  xTaskCreatePinnedToCore(tareaDisplay,       "NextionUI",     4096, NULL, 2, NULL,       0); // Core 0 (Comunicaciones y UI)
+
+// Timer 0, prescaler 80 (80MHz/80 = 1MHz -> 1 tick = 1 us)
   timerMuestreo = timerBegin(0, 80, true);
   timerAttachInterrupt(timerMuestreo, &onTimerMuestreo, true);
-  timerAlarmWrite(timerMuestreo, (uint64_t)(1000000.0f / FS_DETECTOR), true);
+  
+  // 1000000 us / 250 Hz = 4000 ticks de 1 us
+  timerAlarmWrite(timerMuestreo, 4000, true); 
   timerAlarmEnable(timerMuestreo);
-
-  delay(500);
 }
 
 void loop() {
-  myNextion.NextionListen();
-  unsigned long ahora = millis();
-
-  // --- Procesar una muestra de CADA señal cuando el timer lo solicita ---
-  if (banderaMuestra) {
-    uint32_t t_us;
-    portENTER_CRITICAL(&timerMux);
-    t_us = tsMuestra_us;
-    banderaMuestra = false;
-    portEXIT_CRITICAL(&timerMux);
-
-    int crudoECG = analogRead(PIN_ECG); // lecturas fuera de la ISR, seguras
-    int crudoPPG = analogRead(PIN_PPG);
-
-    float muestraECG = (float)crudoECG - 2048.0f; // centra respecto a la línea base
-    float muestraPPG = (float)crudoPPG - 2048.0f;
-
-    pt_process_t(&pt, muestraECG, t_us);
-    ppg_process_t(&ppg, muestraPPG, t_us);
-  }
-
-  // --- Graficar ambas señales en Nextion a 25 Hz (visual, datos reales del ADC) ---
-  if (ahora - tgrafica >= PERIODO_GRAFICA) {
-    tgrafica = ahora;
-
-    int crudoECG = analogRead(PIN_ECG);
-    int crudoPPG = analogRead(PIN_PPG);
-    uint8_t valorECG = map(crudoECG, 0, 4095, 0, ALTURA_WAVE - 1);
-    uint8_t valorPPG = map(crudoPPG, 0, 4095, 0, ALTURA_WAVE - 1);
-
-    agregarPuntoGrafica(ID_WAVE_ECG, CANAL, valorECG);
-    agregarPuntoGrafica(ID_WAVE_PPG, CANAL, valorPPG);
-  }
-
-  // --- Actualizar campos numéricos con FC (ECG) y FP (PPG) reales ---
-  if (ahora - tindicadores >= PERIODO_INDICADORES) {
-    tindicadores = ahora;
-
-    float bpmECG = pt_bpm(&pt);
-    float bpmPPG = ppg_bpm(&ppg);
-
-    int fc = (bpmECG > 0.0f) ? (int)(bpmECG + 0.5f) : 0;
-    int fp = (bpmPPG > 0.0f) ? (int)(bpmPPG + 0.5f) : 0;
-    int spo2 = 00; // pendiente: algoritmo real de SpO2 (razón roja/IR)
-
-    myNextion.writeNum("n0.val", fc);
-    myNextion.writeNum("n1.val", spo2);
-    myNextion.writeNum("n2.val", fp);
-  }
+  // El loop principal no realiza ningún trabajo; FreeRTOS administra el sistema.
+  vTaskDelete(NULL);
 }
