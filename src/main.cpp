@@ -15,10 +15,12 @@ extern "C" {
 #define MOSI     23
 #define CS        5
 #define AFE_RST   4
-#define FIFO_RDY 25   // Movido desde GPIO16: Serial2 (RX2) lo usa ahora la Nextion
+#define FIFO_RDY 16
 
-// Nextion en UART2 (RX2=GPIO16, TX2=GPIO17). Serial (USB) queda libre
+// Nextion en UART2 con pines personalizados. Serial (USB) queda libre
 // para depuracion y el comando CAL.
+#define NEXTION_TX   25   // ESP32 TX -> RX de la Nextion
+#define NEXTION_RX   33   // ESP32 RX <- TX de la Nextion
 #define BAUD_NEXTION 115200
 #define ID_WAVE_ECG  8
 #define ID_WAVE_PPG  7
@@ -26,19 +28,33 @@ extern "C" {
 #define ALTURA_WAVE  200
 
 // =========================================================================
-// Formato de datos del AFE  (*** CONFIRMAR CON AFE4950.h ***)
-// Se asume, por muestra: [ECG 3 bytes][PPG 3 bytes], big-endian, signed 24 bit
+// Formato de paquete del AFE4950 (segun readme.md del ejemplo)
+// Palabra de 4 bytes: [LSB][MID][MSB][TAG]  (valor de 24 bits little-endian)
+// Ciclo de muestras del FIFO: ECG, ECG, PPG, ECG, ECG, PPG, ...
 // =========================================================================
-#define AFE_HEADER_BYTES   0   // bytes de cabecera al inicio de getData(), si los hay
-#define AFE_BYTES_PER_CH   3
-#define AFE_BYTES_PER_SAMP (2 * AFE_BYTES_PER_CH)
+#define TAG_HEADER   0x02
+#define TAG_PDIFF    0x03
+#define TAG_SAMPLE   0x05
+#define TAG_STATUS   0x06   // byte0 = ST (0 sin senal, 1 estabilizando, 2 valida), byte1 = SEG
+#define TAG_AC_IR    0x07
+#define TAG_DC_IR    0x08
+#define TAG_AC_RED   0x09
+#define TAG_DC_RED   0x0A   // ultima palabra del bloque SpO2
 
-#define PPG_SIGN  (+1.0f)      // poner -1.0f si el pulso sale invertido
-#define ALPHA_HP  0.0063f      // HPF de 1 polo ~0.5 Hz @ 500 Hz (quita DC / deriva)
-
+// Cada ciclo (ECG,ECG,PPG) se convierte en UNA muestra a 500 Hz:
+// ecg = promedio de las 2 muestras ECG, ppg = la muestra PPG.
 #define FS_SISTEMA 500.0f
+#define PPG_SIGN   (+1.0f)      // poner -1.0f si el pulso sale invertido
+#define ALPHA_HP   0.0063f      // HPF de 1 polo ~0.5 Hz @ 500 Hz
+
+// SpO2 = A - B*R  (curva del sistema indicada en el readme)
+#define SPO2_A     110.0f
+#define SPO2_B     25.0f
+#define NSPO2      5            // promedio de los ultimos 5 valores (~5 s)
+#define DEBUG_SPO2 1
+
 #define USAR_PIR   1
-#define N_BUF      2048        // ~4 s de historia
+#define N_BUF      2048         // ~4 s de historia
 #define MS_TO_SAMP(x) ((uint32_t)((x) * FS_SISTEMA / 1000.0f))
 #define B_BUF(buf, i) buf[(i) % N_BUF]
 
@@ -53,6 +69,12 @@ struct MuestraTriada {
   uint32_t sampleIdx;
 };
 
+struct DatosSpO2 {
+  uint8_t  estado;     // 0 / 1 / 2
+  uint8_t  seg;
+  uint32_t acIr, dcIr, acRed, dcRed;
+};
+
 struct SignosVitales {
   int fc, fp, spo2, sbp, dbp;
   bool calibrado;
@@ -63,7 +85,7 @@ struct SignosVitales {
 // =========================================================================
 AFE4950 afe;
 
-int32_t ecgBuf[N_BUF], ppgBuf[N_BUF], dcBuf[N_BUF];   // int32: el AFE entrega 22-24 bit
+int32_t ecgBuf[N_BUF], ppgBuf[N_BUF], dcBuf[N_BUF];
 volatile uint32_t totalMuestras = 0;
 
 PanTompkins pt;
@@ -81,8 +103,14 @@ float sumPtt = 0, sumPir = 0;
 int nCal = 0;
 const int N_CAL = 30;
 
+// SpO2
+float hSpo2[NSPO2];
+int nSpo2 = 0, iSpo2 = 0;
+float spo2Prom = 0;
+
 QueueHandle_t colaMuestras;   // Adq -> Proc
 QueueHandle_t colaGrafica;    // Adq -> Display (250 Hz)
+QueueHandle_t colaSpo2;       // Adq -> Proc (1 Hz)
 QueueHandle_t buzonSignos;    // Proc -> Display (mailbox)
 
 EasyNex myNextion(Serial2);
@@ -90,14 +118,19 @@ EasyNex myNextion(Serial2);
 void procesarLatido(uint32_t R, uint32_t Rsig);
 void revisarYPromediar(float ptt, float pir);
 void calcularPA(float ptt, float pir, SignosVitales &sv);
+void actualizarSpO2(const DatosSpO2 &d);
 
 // =========================================================================
 // Utilidades
 // =========================================================================
-static inline int32_t leerInt24(const uint8_t *p) {
-  int32_t v = ((int32_t)p[0] << 16) | ((int32_t)p[1] << 8) | p[2];
-  if (v & 0x800000) v |= 0xFF000000;   // extension de signo
+static inline int32_t valor24Signed(const uint8_t *w) {
+  int32_t v = ((int32_t)w[2] << 16) | ((int32_t)w[1] << 8) | w[0];
+  if (v & 0x800000) v |= 0xFF000000;   // complemento a 2
   return v;
+}
+
+static inline uint32_t valor24Unsigned(const uint8_t *w) {
+  return ((uint32_t)w[2] << 16) | ((uint32_t)w[1] << 8) | w[0];
 }
 
 void agregarPuntoGrafica(int idWave, int canal, int valor) {
@@ -112,7 +145,7 @@ void agregarPuntoGrafica(int idWave, int canal, int valor) {
   Serial2.write(0xFF);
 }
 
-// Autoescala lenta para la pantalla (el AFE no tiene rango fijo 0-4095)
+// Autoescala lenta para la pantalla
 struct AutoEscala { float lo = 0, hi = 1; };
 
 uint8_t escalar(AutoEscala &s, float v) {
@@ -124,57 +157,132 @@ uint8_t escalar(AutoEscala &s, float v) {
   return (uint8_t)constrain(y, 0, ALTURA_WAVE - 1);
 }
 
-// =========================================================================
-// Tarea 1: Adquisicion desde la FIFO del AFE4950 (Core 1, prio 5)
-// =========================================================================
-void tareaAdquisicion(void *pvParameters) {
+// Un ciclo completo (ECG,ECG,PPG) -> una muestra a 500 Hz
+static void emitirMuestra(float ecgProm, int32_t ppgRaw) {
   static uint8_t divisorGrafica = 0;
   static float ecgBase = 0, ppgBase = 0;
   static bool baseInit = false;
 
+  MuestraTriada m;
+  m.rawECG = (int32_t)ecgProm;
+  m.rawPPG = ppgRaw;
+
+  if (!baseInit) {
+    ecgBase = ecgProm;
+    ppgBase = (float)ppgRaw;
+    baseInit = true;
+  }
+  ecgBase += ALPHA_HP * (ecgProm - ecgBase);
+  ppgBase += ALPHA_HP * ((float)ppgRaw - ppgBase);
+
+  m.ecg = ecgProm - ecgBase;
+  m.ppg = ((float)ppgRaw - ppgBase) * PPG_SIGN;
+  m.sampleIdx = totalMuestras;
+
+  B_BUF(ecgBuf, m.sampleIdx) = (int32_t)m.ecg;
+  B_BUF(ppgBuf, m.sampleIdx) = (int32_t)m.ppg;   // AC -> PTT
+  B_BUF(dcBuf,  m.sampleIdx) = ppgRaw;           // DC -> PIR
+  totalMuestras++;
+
+  xQueueSendToBack(colaMuestras, &m, 0);
+
+  if (++divisorGrafica >= 2) {                   // 250 Hz para la pantalla
+    divisorGrafica = 0;
+    xQueueSendToBack(colaGrafica, &m, 0);
+  }
+}
+
+// =========================================================================
+// Tarea 1: Adquisicion y parseo de paquetes del AFE4950 (Core 1, prio 5)
+// =========================================================================
+void tareaAdquisicion(void *pvParameters) {
+  uint8_t fase = 0;          // 0,1 = ECG ; 2 = PPG
+  float ecgAcum = 0;
+  DatosSpO2 spo2 = {};
+
   for (;;) {
-    if (!afe.ready()) {          // watermark de 3 muestras -> ~cada 6 ms
+    if (!afe.ready()) {
       vTaskDelay(1);
       continue;
     }
 
     const uint8_t *data = afe.getData();
-    size_t len = afe.getBytesToSend();
-    if (len <= AFE_HEADER_BYTES) continue;
+    size_t len = afe.getBytesToSend() & ~(size_t)3;   // solo palabras completas
 
-    const uint8_t *p = data + AFE_HEADER_BYTES;
-    size_t nMuestras = (len - AFE_HEADER_BYTES) / AFE_BYTES_PER_SAMP;
+    for (size_t o = 0; o < len; o += 4) {
+      const uint8_t *w = data + o;
 
-    for (size_t s = 0; s < nMuestras; s++, p += AFE_BYTES_PER_SAMP) {
-      MuestraTriada m;
-      m.rawECG = leerInt24(p);
-      m.rawPPG = leerInt24(p + AFE_BYTES_PER_CH);
+      switch (w[3]) {
+        case TAG_HEADER:            // inicio de paquete: el ciclo vuelve a ECG
+          fase = 0;
+          ecgAcum = 0;
+          break;
 
-      if (!baseInit) {
-        ecgBase = m.rawECG;
-        ppgBase = m.rawPPG;
-        baseInit = true;
-      }
-      ecgBase += ALPHA_HP * (m.rawECG - ecgBase);
-      ppgBase += ALPHA_HP * (m.rawPPG - ppgBase);
+        case TAG_PDIFF:             // w[0] + 1 = numero de muestras (no se necesita)
+          break;
 
-      m.ecg = (float)m.rawECG - ecgBase;
-      m.ppg = ((float)m.rawPPG - ppgBase) * PPG_SIGN;
-      m.sampleIdx = totalMuestras;
+        case TAG_SAMPLE: {
+          int32_t v = valor24Signed(w);
+          if (fase < 2) {
+            ecgAcum += (float)v;
+            fase++;
+          } else {                  // muestra PPG: cierra el ciclo
+            emitirMuestra(ecgAcum * 0.5f, v);
+            fase = 0;
+            ecgAcum = 0;
+          }
+          break;
+        }
 
-      B_BUF(ecgBuf, m.sampleIdx) = (int32_t)m.ecg;
-      B_BUF(ppgBuf, m.sampleIdx) = (int32_t)m.ppg;   // AC  -> PTT
-      B_BUF(dcBuf,  m.sampleIdx) = m.rawPPG;         // DC  -> PIR
-      totalMuestras++;
+        case TAG_STATUS:
+          spo2.estado = w[0];
+          spo2.seg    = w[1];
+          break;
+        case TAG_AC_IR:   spo2.acIr  = valor24Unsigned(w); break;
+        case TAG_DC_IR:   spo2.dcIr  = valor24Unsigned(w); break;
+        case TAG_AC_RED:  spo2.acRed = valor24Unsigned(w); break;
+        case TAG_DC_RED:
+          spo2.dcRed = valor24Unsigned(w);
+          xQueueSendToBack(colaSpo2, &spo2, 0);   // bloque SpO2 completo
+          break;
 
-      xQueueSendToBack(colaMuestras, &m, 0);
-
-      if (++divisorGrafica >= 2) {                   // 250 Hz para la pantalla
-        divisorGrafica = 0;
-        xQueueSendToBack(colaGrafica, &m, 0);
+        default:
+          break;
       }
     }
   }
+}
+
+// =========================================================================
+// SpO2: relacion de ratios con los AC/DC entregados por el AFE
+// =========================================================================
+void actualizarSpO2(const DatosSpO2 &d) {
+  // Solo es valida con ESTADO = 2; en los demas estados AC/DC llegan en 0
+  if (d.estado != 2 || d.dcIr == 0 || d.dcRed == 0 || d.acIr == 0) {
+    nSpo2 = 0; iSpo2 = 0; spo2Prom = 0;
+#if DEBUG_SPO2
+    Serial.printf("SpO2: estado=%u (%us)\n", d.estado, d.seg);
+#endif
+    return;
+  }
+
+  float R = ((float)d.acRed / (float)d.dcRed) / ((float)d.acIr / (float)d.dcIr);
+  if (R < 0.2f || R > 3.0f) return;           // fuera de rango fisiologico razonable
+
+  float s = SPO2_A - SPO2_B * R;
+  s = constrain(s, 0.0f, 100.0f);
+
+  hSpo2[iSpo2] = s;
+  iSpo2 = (iSpo2 + 1) % NSPO2;
+  if (nSpo2 < NSPO2) nSpo2++;
+
+  float suma = 0;
+  for (int j = 0; j < nSpo2; j++) suma += hSpo2[j];
+  spo2Prom = suma / nSpo2;
+
+#if DEBUG_SPO2
+  Serial.printf("SpO2: R=%.3f -> %.1f (prom %.1f)\n", R, s, spo2Prom);
+#endif
 }
 
 // =========================================================================
@@ -185,6 +293,7 @@ void tareaProcesamiento(void *pvParameters) {
   ppg_init(&ppgDet, FS_SISTEMA);
 
   MuestraTriada m;
+  DatosSpO2 dsp;
   SignosVitales sv = {0, 0, 0, 0, 0, false};
   TickType_t ultActualizacionUI = xTaskGetTickCount();
 
@@ -207,10 +316,14 @@ void tareaProcesamiento(void *pvParameters) {
         }
       }
 
-      // Timestamp derivado del indice de muestra (las muestras llegan en
-      // rafagas de 3, micros() no refleja el instante real de muestreo)
+      // Timestamp derivado del indice de muestra (los paquetes llegan en rafaga)
       uint32_t tUs = (uint32_t)(m.sampleIdx * (uint32_t)(1000000.0f / FS_SISTEMA));
       ppg_process_t(&ppgDet, m.ppg, tUs);
+    }
+
+    // Parametros de SpO2 (1 Hz)
+    while (xQueueReceive(colaSpo2, &dsp, 0) == pdTRUE) {
+      actualizarSpO2(dsp);
     }
 
     if (Serial.available()) {
@@ -232,7 +345,7 @@ void tareaProcesamiento(void *pvParameters) {
 
       sv.fc   = (bpmECG > 0.0f) ? (int)(bpmECG + 0.5f) : 0;
       sv.fp   = (bpmPPG > 0.0f) ? (int)(bpmPPG + 0.5f) : 0;
-      sv.spo2 = 98;   // marcador: un solo canal PPG no permite SpO2
+      sv.spo2 = (nSpo2 > 0) ? (int)(spo2Prom + 0.5f) : 0;   // 0 = sin medida valida
 
       calcularPA(pttProm, pirProm, sv);
       xQueueOverwrite(buzonSignos, &sv);
@@ -343,8 +456,8 @@ void tareaDisplay(void *pvParameters) {
       myNextion.writeNum("n0.val", sv.fc);
       myNextion.writeNum("n1.val", sv.spo2);
       myNextion.writeNum("n2.val", sv.fp);
-      myNextion.writeNum("n3.val", sv.sbp);
-      myNextion.writeNum("n4.val", sv.dbp);
+      myNextion.writeNum("nSBP.val", sv.sbp);
+      myNextion.writeNum("nDBP.val", sv.dbp);
     }
 
     vTaskDelay(pdMS_TO_TICKS(20));
@@ -356,24 +469,29 @@ void tareaDisplay(void *pvParameters) {
 // =========================================================================
 void setup() {
   Serial.begin(115200);       // USB: solo depuracion / comando CAL
-  Serial.setTimeout(10);      // readStringUntil no debe bloquear al DSP
+  Serial.setTimeout(10);
   myNextion.begin(BAUD_NEXTION);
+  // EasyNex abre Serial2 con los pines por defecto (16/17): se reabre con los nuestros
+  Serial2.end();
+  Serial2.begin(BAUD_NEXTION, SERIAL_8N1, NEXTION_RX, NEXTION_TX);
 
   while (!afe.configure(SCLK, MISO, MOSI, CS, AFE_RST, FIFO_RDY)) {
     Serial.println("Error con la configuracion del AFE4950");
     delay(500);
   }
+  afe.enableSpO2(true);       // agrega ESTADO + AC/DC IR + AC/DC RED cada segundo
 
   colaMuestras = xQueueCreate(128, sizeof(MuestraTriada));
   colaGrafica  = xQueueCreate(64,  sizeof(MuestraTriada));
+  colaSpo2     = xQueueCreate(4,   sizeof(DatosSpO2));
   buzonSignos  = xQueueCreate(1,   sizeof(SignosVitales));
-  assert(colaMuestras && colaGrafica && buzonSignos);
+  assert(colaMuestras && colaGrafica && colaSpo2 && buzonSignos);
 
   xTaskCreatePinnedToCore(tareaAdquisicion,   "Adquisicion",   4096, NULL, 5, NULL, 1);
   xTaskCreatePinnedToCore(tareaProcesamiento, "Procesamiento", 8192, NULL, 4, NULL, 1);
   xTaskCreatePinnedToCore(tareaDisplay,       "NextionUI",     4096, NULL, 2, NULL, 0);
 
-  afe.enableCapture();        // inicia la captura ECG+PPG a 500 Hz
+  afe.enableCapture();        // inicia la captura
 
   Serial.println("Escribe CAL <SBP> <DBP> en la consola para calibrar (ej. CAL 120 80)");
 }
@@ -381,3 +499,4 @@ void setup() {
 void loop() {
   vTaskDelete(NULL);
 }
+
