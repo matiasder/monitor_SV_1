@@ -343,8 +343,8 @@ void tareaDisplay(void *pvParameters) {
       myNextion.writeNum("n0.val", sv.fc);
       myNextion.writeNum("n1.val", sv.spo2);
       myNextion.writeNum("n2.val", sv.fp);
-      myNextion.writeNum("nSBP.val", sv.sbp);
-      myNextion.writeNum("nDBP.val", sv.dbp);
+      myNextion.writeNum("n3.val", sv.sbp);
+      myNextion.writeNum("n4.val", sv.dbp);
     }
 
     vTaskDelay(pdMS_TO_TICKS(20));
