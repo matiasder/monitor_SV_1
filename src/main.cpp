@@ -24,6 +24,15 @@ extern "C" {
 #define CANAL        0
 #define ALTURA_WAVE  200
 
+// Componente de texto del HMI donde se muestra el estado de la calibracion
+// ("Sin calibrar", "Calibrando 12/30", "Calibrado"). Si tu HMI no lo tiene,
+// comenta esta linea y no se envia nada.
+#define OBJ_ESTADO   "t1"   // IMPORTANTE: en el HMI, subir t1.txt_maxl a 80 o mas
+
+// 1 = mientras calibra, el texto de estado muestra contadores de diagnostico
+//     (por que se descartan los latidos). 0 = solo "Calibrando n/30".
+#define DIAG_CAL     1
+
 // =========================================================================
 // Formato de paquete del AFE4950
 // Palabra de 4 bytes: [LSB][MID][MSB][TAG]
@@ -56,6 +65,11 @@ extern "C" {
 #define SPO2_MIN_PCT 80.0f    // por debajo se considera senal mala (igual que el companero)
 #define NSPO2        5
 
+// Frecuencia de pulso (FP) a partir del PPG
+#define FP_PROPIO      1        // 1 = detector propio (mas abajo), 0 = ppg_process_t/ppg_bpm de biosignals.h
+#define PPG_MIN_AMP    1000.0f  // amplitud pico a pico minima (cuentas del AFE) para aceptar pulsos
+#define PPG_REFRACT_MS 300      // intervalo minimo entre latidos (ms) -> maximo 200 lpm
+
 #define USAR_PIR   1
 #define N_BUF      2048       // ~8 s de historia a 250 Hz
 #define MS_TO_SAMP(x) ((uint32_t)((x) * FS_SISTEMA / 1000.0f))
@@ -83,6 +97,12 @@ struct DatosSpO2 {
 struct SignosVitales {
   int fc, fp, spo2, sbp, dbp;
   bool calibrado;
+  uint8_t calEstado;      // 0 = sin calibrar, 1 = calibrando, 2 = calibrado
+  uint8_t calProgreso;    // latidos acumulados (0..N_CAL)
+};
+
+struct CmdCal {           // comando de calibracion recibido desde la Nextion
+  float sbp, dbp;
 };
 
 // =========================================================================
@@ -108,6 +128,15 @@ float sumPtt = 0, sumPir = 0;
 int nCal = 0;
 const int N_CAL = 30;
 
+// Diagnostico de la calibracion: latidos descartados por motivo
+volatile uint16_t dgR = 0;      // picos R detectados por Pan-Tompkins
+volatile uint16_t dgRR = 0;     // intervalo RR fuera de 333-2000 ms
+volatile uint16_t dgPend = 0;   // sin pendiente positiva en el PPG / DC invalido
+volatile uint16_t dgPtt = 0;    // PTT fuera de 150-450 ms
+volatile uint16_t dgPir = 0;    // PIR fuera de rango
+volatile uint16_t dgDev = 0;    // PTT desviado >20 % del promedio
+volatile float dgUltPtt = 0, dgUltPir = 0;   // ultimos valores calculados (antes de filtrar)
+
 // SpO2
 float hSpo2[NSPO2];
 int nSpo2 = 0, iSpo2 = 0;
@@ -117,6 +146,7 @@ QueueHandle_t colaMuestras;   // Adq -> Proc
 QueueHandle_t colaGrafica;    // Adq -> Display
 QueueHandle_t colaSpo2;       // Adq -> Proc (1 Hz)
 QueueHandle_t buzonSignos;    // Proc -> Display (mailbox)
+QueueHandle_t colaCal;        // Display -> Proc (comando de calibracion)
 
 EasyNex myNextion(Serial);
 
@@ -124,6 +154,7 @@ void procesarLatido(uint32_t R, uint32_t Rsig);
 void revisarYPromediar(float ptt, float pir);
 void calcularPA(float ptt, float pir, SignosVitales &sv);
 void actualizarSpO2(const DatosSpO2 &d);
+void iniciarCalibracion(float sbp, float dbp);
 
 // =========================================================================
 // Utilidades de muestreo y filtrado
@@ -297,9 +328,100 @@ void tareaAdquisicion(void *pvParameters) {
 }
 
 // =========================================================================
+// Detector propio de pulso en el PPG (para la FP)
+// Umbral adaptativo con histeresis sobre la envolvente de la senal AC:
+//  - dispara al cruzar el 60 % de la amplitud hacia arriba y no vuelve a
+//    armarse hasta bajar del 40 % (evita contar la muesca dicrota),
+//  - exige amplitud minima (PPG_MIN_AMP) y un intervalo minimo entre latidos,
+//  - la FP es 60000 / mediana de los ultimos 5 intervalos y vuelve a 0 si no
+//    hay latidos en 3 s.
+// =========================================================================
+struct DetectorPulso {
+  float    hi, lo;        // envolvente superior / inferior
+  bool     armado;        // true = esperando cruce ascendente
+  bool     inicio;
+  uint32_t idxUlt;        // indice de la ultima deteccion
+  uint16_t rr[5];         // ultimos intervalos (ms)
+  uint8_t  nRR, iRR;
+};
+DetectorPulso dp;
+
+volatile uint8_t estadoAFE = 0;   // estado de la senal segun el AFE: 0 sin dedo, 1 estabilizando, 2 valida
+
+void dpReset() {
+  memset(&dp, 0, sizeof(dp));
+  dp.armado = true;
+}
+
+void dpProcesar(float x, uint32_t idx) {
+  if (!dp.inicio) { dp.hi = x; dp.lo = x; dp.inicio = true; }
+
+  // Envolvente: sube de inmediato, baja con constante de tiempo ~2 s
+  const float k = 1.0f / (2.0f * FS_SISTEMA);
+  if (x > dp.hi) dp.hi = x; else dp.hi -= (dp.hi - x) * k;
+  if (x < dp.lo) dp.lo = x; else dp.lo += (x - dp.lo) * k;
+
+  float amp = dp.hi - dp.lo;
+  if (amp < PPG_MIN_AMP) {            // no hay un pulso claro
+    dp.armado = true;
+    return;
+  }
+
+  float umbralAlto = dp.lo + 0.6f * amp;
+  float umbralBajo = dp.lo + 0.4f * amp;
+
+  if (!dp.armado) {
+    if (x < umbralBajo) dp.armado = true;     // histeresis
+    return;
+  }
+  if (x <= umbralAlto) return;
+
+  dp.armado = false;
+  if (dp.idxUlt != 0) {
+    float ms = (float)(idx - dp.idxUlt) * 1000.0f / FS_SISTEMA;
+    if (ms < PPG_REFRACT_MS) return;          // demasiado pronto: se ignora
+    if (ms <= 1500.0f) {
+      dp.rr[dp.iRR] = (uint16_t)ms;
+      dp.iRR = (dp.iRR + 1) % 5;
+      if (dp.nRR < 5) dp.nRR++;
+    } else {                                  // se perdio la secuencia: reinicia el historial
+      dp.nRR = 0;
+      dp.iRR = 0;
+    }
+  }
+  dp.idxUlt = idx;
+}
+
+float dpBpm(uint32_t idxAhora) {
+  if (dp.nRR < 3) return 0.0f;
+  float msDesdeUlt = (float)(idxAhora - dp.idxUlt) * 1000.0f / FS_SISTEMA;
+  if (msDesdeUlt > 3000.0f) return 0.0f;      // sin latidos recientes
+
+  uint16_t t[5];
+  uint8_t n = dp.nRR;
+  for (uint8_t i = 0; i < n; i++) t[i] = dp.rr[i];
+  for (uint8_t i = 1; i < n; i++) {           // ordenacion por insercion
+    uint16_t v = t[i];
+    int j = (int)i - 1;
+    while (j >= 0 && t[j] > v) { t[j + 1] = t[j]; j--; }
+    t[j + 1] = v;
+  }
+  return 60000.0f / (float)t[n / 2];          // mediana
+}
+
+// =========================================================================
 // SpO2
 // =========================================================================
 void actualizarSpO2(const DatosSpO2 &d) {
+  // Estado del dedo segun el AFE; al quitarlo se reinician los detectores de pulso
+  static uint8_t estadoPrev = 255;
+  estadoAFE = d.estado;
+  if (d.estado == 0 && estadoPrev != 0) {
+    dpReset();
+    ppg_init(&ppgDet, FS_SISTEMA);
+  }
+  estadoPrev = d.estado;
+
   if (d.estado != 2 || d.acIr == 0 || d.dcIr == 0 || d.acRed == 0 || d.dcRed == 0) {
     nSpo2 = 0; iSpo2 = 0; spo2Prom = 0;
     return;
@@ -330,6 +452,7 @@ void actualizarSpO2(const DatosSpO2 &d) {
 void tareaProcesamiento(void *pvParameters) {
   pt_init(&pt, FS_SISTEMA);
   ppg_init(&ppgDet, FS_SISTEMA);
+  dpReset();
 
   MuestraTriada m;
   DatosSpO2 dsp;
@@ -340,6 +463,7 @@ void tareaProcesamiento(void *pvParameters) {
     if (xQueueReceive(colaMuestras, &m, pdMS_TO_TICKS(50)) == pdTRUE) {
       PT_Result r = pt_process(&pt, m.ecg);
       if (r.beat) {
+        dgR++;
         uint32_t idxNotif = m.sampleIdx;
         if (idxNotif >= MS_TO_SAMP(500)) {
           uint32_t ini = idxNotif - MS_TO_SAMP(400);
@@ -355,23 +479,40 @@ void tareaProcesamiento(void *pvParameters) {
         }
       }
 
+#if FP_PROPIO
+      dpProcesar(m.ppg, m.sampleIdx);
+#else
       uint32_t tUs = (uint32_t)(m.sampleIdx * (uint32_t)(1000000.0f / FS_SISTEMA));
       ppg_process_t(&ppgDet, m.ppg, tUs);
+#endif
     }
 
     while (xQueueReceive(colaSpo2, &dsp, 0) == pdTRUE) {
       actualizarSpO2(dsp);
     }
 
+    // Comando de calibracion enviado desde la Nextion (BP:<sbp>/<dbp>)
+    CmdCal cc;
+    if (xQueueReceive(colaCal, &cc, 0) == pdTRUE) {
+      iniciarCalibracion(cc.sbp, cc.dbp);
+    }
+
     if ((xTaskGetTickCount() - ultActualizacionUI) >= pdMS_TO_TICKS(1000)) {
       ultActualizacionUI = xTaskGetTickCount();
 
       float bpmECG = pt_bpm(&pt);
+#if FP_PROPIO
+      float bpmPPG = dpBpm(m.sampleIdx);
+#else
       float bpmPPG = ppg_bpm(&ppgDet);
+#endif
+      if (estadoAFE == 0) bpmPPG = 0.0f;      // sin dedo: FP en 0
 
       sv.fc   = (bpmECG > 0.0f) ? (int)(bpmECG + 0.5f) : 0;
       sv.fp   = (bpmPPG > 0.0f) ? (int)(bpmPPG + 0.5f) : 0;
       sv.spo2 = (nSpo2 > 0) ? (int)(spo2Prom + 0.5f) : 0;
+      sv.calEstado   = calibrando ? 1 : (calibrado ? 2 : 0);
+      sv.calProgreso = (uint8_t)nCal;
 
       calcularPA(pttProm, pirProm, sv);
       xQueueOverwrite(buzonSignos, &sv);
@@ -384,7 +525,7 @@ void tareaProcesamiento(void *pvParameters) {
 // =========================================================================
 void procesarLatido(uint32_t R, uint32_t Rsig) {
   float rr = (Rsig - R) * 1000.0f / FS_SISTEMA;
-  if (rr < 333 || rr > 2000) return;
+  if (rr < 333 || rr > 2000) { dgRR++; return; }
 
   uint32_t fin = R + MS_TO_SAMP(500);
   if (fin > Rsig) fin = Rsig;
@@ -396,7 +537,7 @@ void procesarLatido(uint32_t R, uint32_t Rsig) {
     int32_t pend = B_BUF(ppgBuf, i + PEND_N) - B_BUF(ppgBuf, i - PEND_N);
     if (pend > mejor) { mejor = pend; k = i; }
   }
-  if (mejor <= 0) return;
+  if (mejor <= 0) { dgPend++; return; }
 
   float ptt = (k - R) * 1000.0f / FS_SISTEMA;
   float pir = 1.0f;
@@ -413,18 +554,20 @@ void procesarLatido(uint32_t R, uint32_t Rsig) {
     if (B_BUF(dcBuf, i) < IL) IL = B_BUF(dcBuf, i);
   }
 
-  if (IL <= 0 || IH <= 0) return;
+  if (IL <= 0 || IH <= 0) { dgPend++; return; }
   pir = (float)IH / (float)IL;
 #endif
 
+  dgUltPtt = ptt;
+  dgUltPir = pir;
   revisarYPromediar(ptt, pir);
 }
 
 void revisarYPromediar(float ptt, float pir) {
-  if (ptt < 150 || ptt > 450) return;
-  if (USAR_PIR && (pir <= 1.0f || pir > 1.3f)) return;
+  if (ptt < 150 || ptt > 450) { dgPtt++; return; }
+  if (USAR_PIR && (pir <= 1.0f || pir > 1.3f)) { dgPir++; return; }
 
-  if (nProm == NPROM && fabsf(ptt - pttProm) > 0.2f * pttProm) return;
+  if (nProm == NPROM && fabsf(ptt - pttProm) > 0.2f * pttProm) { dgDev++; return; }
 
   hPtt[iProm] = ptt;
   hPir[iProm] = pir;
@@ -462,6 +605,72 @@ void calcularPA(float ptt, float pir, SignosVitales &sv) {
 }
 
 // =========================================================================
+// Calibracion desde la Nextion
+//
+// La Nextion envia por UART la trama ASCII:   BP:<sbp><separador><dbp>\n
+// (por ejemplo "BP:120/80\n", "BP:120 80\n" o "BP:120,80\n").
+// Se lee en la tarea de pantalla (unica tarea que usa Serial) y el comando se
+// pasa a la tarea de procesamiento por colaCal.
+// =========================================================================
+void iniciarCalibracion(float sbp, float dbp) {   // se ejecuta en tareaProcesamiento
+  SBPO = sbp; DBPO = dbp;
+  sumPtt = 0; sumPir = 0; nCal = 0;
+  calibrado = false; calibrando = true;
+}
+
+// Texto de estado en la Nextion (solo desde tareaDisplay, para no mezclar
+// instrucciones con las de las ondas)
+static void notificarEstado(const char *txt) {
+#ifdef OBJ_ESTADO
+  Serial.print(OBJ_ESTADO ".txt=\"");
+  Serial.print(txt);
+  Serial.print("\"");
+  Serial.write(0xFF);
+  Serial.write(0xFF);
+  Serial.write(0xFF);
+#endif
+}
+
+static void procesarLineaNextion(const char *linea) {
+  const char *p = strstr(linea, "BP:");
+  if (!p) return;                         // no es una trama de calibracion: se ignora
+
+  int sbp, dbp;
+  // Dos enteros separados por cualquier caracter no numerico
+  if (sscanf(p + 3, "%d%*[^0-9]%d", &sbp, &dbp) != 2) {
+    notificarEstado("Formato invalido");
+    return;
+  }
+  // Limites de cordura (ajustables)
+  if (sbp < 60 || sbp > 250 || dbp < 30 || dbp > 150 || sbp <= dbp) {
+    notificarEstado("Valores fuera de rango");
+    return;
+  }
+
+  CmdCal cmd = { (float)sbp, (float)dbp };
+  xQueueOverwrite(colaCal, &cmd);         // la tarea de procesamiento la recoge
+}
+
+// Ensambla lineas terminadas en '\n' (0x0A) sin bloquear
+static void leerComandosNextion() {
+  static char linea[32];
+  static uint8_t n = 0;
+
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c == '\n') {
+      linea[n] = '\0';
+      n = 0;
+      procesarLineaNextion(linea);
+    } else if (n < sizeof(linea) - 1) {
+      linea[n++] = c;
+    } else {
+      n = 0;                              // linea demasiado larga: descartar
+    }
+  }
+}
+
+// =========================================================================
 // Tarea 3: Nextion UI (Core 0, prio 2)
 // =========================================================================
 void tareaDisplay(void *pvParameters) {
@@ -470,9 +679,12 @@ void tareaDisplay(void *pvParameters) {
 
   AutoEscala escEcg;
   AutoEscala escPpg;
+  int estadoMostrado = -1;
 
   for (;;) {
-    myNextion.NextionListen();
+    // Se lee el puerto con nuestro propio parser: NextionListen() consumiria
+    // los mismos bytes (solo se usa EasyNex para escribir numeros).
+    leerComandosNextion();
 
     while (xQueueReceive(colaGrafica, &m, 0) == pdTRUE) {
       uint8_t valEcg = escalar(escEcg, m.ecg);
@@ -486,8 +698,30 @@ void tareaDisplay(void *pvParameters) {
       myNextion.writeNum("n0.val", sv.fc);
       myNextion.writeNum("n1.val", sv.spo2);
       myNextion.writeNum("n2.val", sv.fp);
-      myNextion.writeNum("n3.val", sv.sbp);
-      myNextion.writeNum("n4.val", sv.dbp);
+      myNextion.writeNum("nSBP.val", sv.sbp);
+      myNextion.writeNum("nDBP.val", sv.dbp);
+
+#ifdef OBJ_ESTADO
+      if (sv.calEstado == 1 || sv.calEstado != estadoMostrado) {
+        estadoMostrado = sv.calEstado;
+        char txt[80];
+        if (sv.calEstado == 1) {
+#if DIAG_CAL
+          snprintf(txt, sizeof(txt), "Cal %u/%d R%u rr%u pd%u pt%u pi%u dv%u | %.0fms %.3f",
+                   (unsigned)sv.calProgreso, N_CAL, (unsigned)dgR, (unsigned)dgRR,
+                   (unsigned)dgPend, (unsigned)dgPtt, (unsigned)dgPir, (unsigned)dgDev,
+                   (double)dgUltPtt, (double)dgUltPir);
+#else
+          snprintf(txt, sizeof(txt), "Calibrando %u/%d", (unsigned)sv.calProgreso, N_CAL);
+#endif
+        } else if (sv.calEstado == 2) {
+          snprintf(txt, sizeof(txt), "Calibrado");
+        } else {
+          snprintf(txt, sizeof(txt), "Sin calibrar");
+        }
+        notificarEstado(txt);
+      }
+#endif
     }
 
     vTaskDelay(pdMS_TO_TICKS(20));
@@ -510,7 +744,8 @@ void setup() {
   colaGrafica  = xQueueCreate(64,  sizeof(MuestraTriada));
   colaSpo2     = xQueueCreate(4,   sizeof(DatosSpO2));
   buzonSignos  = xQueueCreate(1,   sizeof(SignosVitales));
-  assert(colaMuestras && colaGrafica && colaSpo2 && buzonSignos);
+  colaCal      = xQueueCreate(1,   sizeof(CmdCal));
+  assert(colaMuestras && colaGrafica && colaSpo2 && buzonSignos && colaCal);
 
   xTaskCreatePinnedToCore(tareaAdquisicion,   "Adquisicion",   4096, NULL, 5, NULL, 1);
   xTaskCreatePinnedToCore(tareaProcesamiento, "Procesamiento", 8192, NULL, 4, NULL, 1);
@@ -522,4 +757,5 @@ void setup() {
 void loop() {
   vTaskDelete(NULL);
 }
+
 
