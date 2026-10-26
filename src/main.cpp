@@ -160,6 +160,14 @@ QueueHandle_t colaCal;        // Display -> Proc (comando de calibracion)
 
 EasyNex myNextion(Serial);
 
+// El puerto serie lo usan la tarea de pantalla y la de alarmas: este mutex
+// evita que se mezclen los bytes de sus comandos
+SemaphoreHandle_t mtxSerial;
+
+// Alarmas (ver seccion "Alarmas de FC")
+volatile int  fcAlarma   = 0;       // ultima FC calculada (la escribe tareaProcesamiento)
+volatile bool silenciado = false;   // estado de bt1 (lo escribe el lector del serial)
+
 void procesarLatido(uint32_t R, uint32_t Rsig);
 void revisarYPromediar(float ptt, float pir);
 void calcularPA(float ptt, float pir, SignosVitales &sv);
@@ -185,7 +193,25 @@ static inline float filtrarLPF(float in, float &outPrev) {
   return outPrev;
 }
 
+static inline bool serialTomar() {
+  return xSemaphoreTake(mtxSerial, pdMS_TO_TICKS(50)) == pdTRUE;
+}
+static inline void serialSoltar() {
+  xSemaphoreGive(mtxSerial);
+}
+
+// Envia un comando a la Nextion (con los tres 0xFF finales)
+void nexCmd(const char *cmd) {
+  if (!serialTomar()) return;
+  Serial.print(cmd);
+  Serial.write(0xFF);
+  Serial.write(0xFF);
+  Serial.write(0xFF);
+  serialSoltar();
+}
+
 void agregarPuntoGrafica(int idWave, int canal, int valor) {
+  if (!serialTomar()) return;
   Serial.print("add ");
   Serial.print(idWave);
   Serial.print(",");
@@ -195,6 +221,7 @@ void agregarPuntoGrafica(int idWave, int canal, int valor) {
   Serial.write(0xFF);
   Serial.write(0xFF);
   Serial.write(0xFF);
+  serialSoltar();
 }
 
 // Autoescala adaptativa para la pantalla Nextion
@@ -643,6 +670,7 @@ void tareaProcesamiento(void *pvParameters) {
       if (estadoAFE == 0) bpmPPG = 0.0f;      // sin dedo: FP en 0
 
       sv.fc   = (bpmECG > 0.0f) ? (int)(bpmECG + 0.5f) : 0;
+      fcAlarma = sv.fc;                         // la lee tareaAlarmas
       sv.fp   = (bpmPPG > 0.0f) ? (int)(bpmPPG + 0.5f) : 0;
       sv.spo2 = (nSpo2 > 0) ? (int)(spo2Prom + 0.5f) : 0;
       sv.calEstado   = calibrando ? 1 : (calibrado ? 2 : 0);
@@ -756,13 +784,148 @@ void iniciarCalibracion(float sbp, float dbp) {   // se ejecuta en tareaProcesam
 // instrucciones con las de las ondas)
 static void notificarEstado(const char *txt) {
 #ifdef OBJ_ESTADO
+  if (!serialTomar()) return;
   Serial.print(OBJ_ESTADO ".txt=\"");
   Serial.print(txt);
   Serial.print("\"");
   Serial.write(0xFF);
   Serial.write(0xFF);
   Serial.write(0xFF);
+  serialSoltar();
 #endif
+}
+
+// =========================================================================
+// Alarmas de FC (ver CLAUDE.md)
+//  - Niveles: normal 50-120, aviso <50 o >120, peligro <40 o >140 lpm.
+//  - Histeresis de 2 lpm para salir de un nivel y 3 s fuera de rango antes
+//    de subir de nivel. Bajar de nivel es inmediato.
+//  - FC = 0 (sin ECG / electrodos sueltos) se trata como "sin dato": no alarma.
+//  - Esta tarea es el maestro del tiempo: el mismo tick maneja el buzzer y el
+//    margen (click m0,1 / click m0,0). El buzzer se actualiza ANTES de escribir
+//    en la pantalla y no depende de que la Nextion responda.
+//  - Silenciar (bt1 = 1) solo apaga el buzzer; el margen sigue parpadeando.
+//  - Una alarma nueva o de mayor prioridad, o volver a normal, quita el silencio.
+// =========================================================================
+#define PIN_BUZZER         25      // buzzer activo: HIGH = suena
+#define FC_AVISO_BAJA      50
+#define FC_AVISO_ALTA      120
+#define FC_PELIGRO_BAJA    40
+#define FC_PELIGRO_ALTA    140
+#define ALARMA_HIST        2       // lpm
+#define ALARMA_RETARDO_MS  3000
+#define ALARMA_TICK_MS     10
+#define COLOR_PELIGRO      63488   // rojo
+#define COLOR_AVISO        64800   // ambar
+
+enum NivelAlarma : uint8_t { NIVEL_NORMAL = 0, NIVEL_AVISO = 1, NIVEL_PELIGRO = 2 };
+
+struct PatronAlarma {
+  uint16_t margenOnMs, margenOffMs;   // parpadeo del margen
+  uint8_t  pulsos;                    // pulsos por rafaga del buzzer
+  uint16_t pulsoOnMs, pulsoOffMs;
+  uint16_t pausaMs;                   // silencio entre rafagas
+  uint16_t color;
+};
+
+static const PatronAlarma PATRON[3] = {
+  {   0,   0,  0,   0,   0,    0, 0             },   // normal
+  { 800, 800,  3, 200, 200, 4000, COLOR_AVISO   },   // aviso:   ~0.6 Hz, 3 pulsos lentos
+  { 250, 250, 10, 100, 100, 2000, COLOR_PELIGRO },   // peligro: 2 Hz, 10 pulsos rapidos
+};
+
+// Nivel que corresponde a la FC; para salir del nivel actual hay que entrar
+// ALARMA_HIST lpm dentro del rango (histeresis)
+static uint8_t nivelPara(int fc, uint8_t actual) {
+  int hP = (actual >= NIVEL_PELIGRO) ? ALARMA_HIST : 0;
+  int hA = (actual >= NIVEL_AVISO)   ? ALARMA_HIST : 0;
+  if (fc < FC_PELIGRO_BAJA + hP || fc > FC_PELIGRO_ALTA - hP) return NIVEL_PELIGRO;
+  if (fc < FC_AVISO_BAJA   + hA || fc > FC_AVISO_ALTA   - hA) return NIVEL_AVISO;
+  return NIVEL_NORMAL;
+}
+
+static void quitarSilencio() {
+  silenciado = false;
+  nexCmd("bt1.val=0");
+  nexCmd("page0.silencio0.val=0");
+}
+
+static void enviarColorMargen(uint16_t color) {
+  char cmd[20];
+  for (int i = 20; i <= 23; i++) {
+    snprintf(cmd, sizeof(cmd), "t%d.bco=%u", i, (unsigned)color);
+    nexCmd(cmd);
+  }
+}
+
+void tareaAlarmas(void *pvParameters) {
+  pinMode(PIN_BUZZER, OUTPUT);
+  digitalWrite(PIN_BUZZER, LOW);
+
+  uint8_t  nivel = NIVEL_NORMAL;
+  bool     esperando = false;       // FC fuera de rango, contando el retardo
+  uint8_t  nivelEspera = NIVEL_NORMAL;
+  uint32_t tEspera = 0;
+  uint32_t t0 = 0;                  // inicio del patron del nivel actual
+  bool     margenOn = false, buzzerOn = false;
+
+  TickType_t ultimo = xTaskGetTickCount();
+  for (;;) {
+    vTaskDelayUntil(&ultimo, pdMS_TO_TICKS(ALARMA_TICK_MS));
+    uint32_t ahora = millis();
+
+    // 1. Nivel objetivo segun la FC
+    int fc = fcAlarma;
+    uint8_t objetivo = (fc > 0) ? nivelPara(fc, nivel) : NIVEL_NORMAL;
+    uint8_t nuevo = nivel;
+    if (objetivo > nivel) {                     // subir: solo tras 3 s fuera de rango
+      if (!esperando) { esperando = true; tEspera = ahora; nivelEspera = objetivo; }
+      else if (objetivo < nivelEspera) nivelEspera = objetivo;   // el nivel sostenido los 3 s
+      if (ahora - tEspera >= ALARMA_RETARDO_MS) { nuevo = nivelEspera; esperando = false; }
+    } else {                                    // igual o menor: inmediato
+      esperando = false;
+      nuevo = objetivo;
+    }
+
+    // 2. Cambio de nivel
+    if (nuevo != nivel) {
+      bool sube = nuevo > nivel;
+      nivel = nuevo;
+      t0 = ahora;
+      if (nivel == NIVEL_NORMAL) {
+        buzzerOn = false;
+        digitalWrite(PIN_BUZZER, LOW);
+        margenOn = false;
+        nexCmd("click m0,0");
+        quitarSilencio();
+      } else {
+        if (sube) quitarSilencio();             // alarma nueva o de mayor prioridad
+        enviarColorMargen(PATRON[nivel].color);
+        margenOn = false;
+        nexCmd("click m0,0");                   // el parpadeo arranca limpio con el color nuevo
+      }
+    }
+    if (nivel == NIVEL_NORMAL) continue;
+
+    // 3. Patron: buzzer primero (no depende de la pantalla), luego el margen
+    const PatronAlarma &p = PATRON[nivel];
+    uint32_t dt = ahora - t0;
+
+    uint32_t periodoPulso = (uint32_t)p.pulsoOnMs + p.pulsoOffMs;
+    uint32_t rafaga = (uint32_t)p.pulsos * periodoPulso;
+    uint32_t tc = dt % (rafaga + p.pausaMs);
+    bool bOn = !silenciado && tc < rafaga && (tc % periodoPulso) < p.pulsoOnMs;
+    if (bOn != buzzerOn) {
+      buzzerOn = bOn;
+      digitalWrite(PIN_BUZZER, bOn ? HIGH : LOW);
+    }
+
+    bool mOn = (dt % ((uint32_t)p.margenOnMs + p.margenOffMs)) < p.margenOnMs;
+    if (mOn != margenOn) {
+      margenOn = mOn;
+      nexCmd(mOn ? "click m0,1" : "click m0,0");
+    }
+  }
 }
 
 static void procesarLineaNextion(const char *linea) {
@@ -785,13 +948,38 @@ static void procesarLineaNextion(const char *linea) {
   xQueueOverwrite(colaCal, &cmd);         // la tarea de procesamiento la recoge
 }
 
-// Ensambla lineas terminadas en '\n' (0x0A) sin bloquear
+// Lee lo que manda la Nextion sin bloquear:
+//  - lineas ASCII terminadas en '\n' (calibracion "BP:<sbp>/<dbp>"),
+//  - el byte de bt1 (prints bt1.val,1): 0x00 = alarma activa, 0x01 = silenciada,
+//  - codigos de retorno / eventos de la Nextion (terminan en FF FF FF): se ignoran.
+// Un 0x00/0x01 solo se toma como bt1 si llega SOLO (sin otro byte en 20 ms);
+// si lo sigue otro byte, era parte de una trama de la Nextion (p. ej. 01 FF FF FF).
 static void leerComandosNextion() {
   static char linea[32];
   static uint8_t n = 0;
+  static uint8_t nFF = 0;
+  static bool     bt1Pend = false;
+  static uint8_t  bt1Val = 0;
+  static uint32_t bt1T = 0;
 
   while (Serial.available()) {
-    char c = (char)Serial.read();
+    uint8_t b = (uint8_t)Serial.read();
+    bt1Pend = false;                      // llego otro byte enseguida: no era bt1
+
+    if (b == 0xFF) {
+      if (++nFF >= 3) { nFF = 0; n = 0; } // fin de una trama de la Nextion: se descarta
+      continue;
+    }
+    nFF = 0;
+
+    if (b == 0x00 || b == 0x01) {         // posible byte de bt1
+      bt1Pend = true;
+      bt1Val = b;
+      bt1T = millis();
+      continue;
+    }
+
+    char c = (char)b;
     if (c == '\n') {
       linea[n] = '\0';
       n = 0;
@@ -801,6 +989,12 @@ static void leerComandosNextion() {
     } else {
       n = 0;                              // linea demasiado larga: descartar
     }
+  }
+
+  // El byte de bt1 llego solo: se acepta como estado del silencio
+  if (bt1Pend && (millis() - bt1T) >= 20) {
+    bt1Pend = false;
+    silenciado = (bt1Val == 0x01);
   }
 }
 
@@ -829,11 +1023,14 @@ void tareaDisplay(void *pvParameters) {
     }
 
     if (xQueueReceive(buzonSignos, &sv, 0) == pdTRUE) {
-      myNextion.writeNum("n0.val", sv.fc);
-      myNextion.writeNum("n1.val", sv.spo2);
-      myNextion.writeNum("n2.val", sv.fp);
-      myNextion.writeNum("n3.val", sv.sbp);
-      myNextion.writeNum("n4.val", sv.dbp);
+      if (serialTomar()) {
+        myNextion.writeNum("n0.val", sv.fc);
+        myNextion.writeNum("n1.val", sv.spo2);
+        myNextion.writeNum("n2.val", sv.fp);
+        myNextion.writeNum("n3.val", sv.sbp);
+        myNextion.writeNum("n4.val", sv.dbp);
+        serialSoltar();
+      }
 
 #ifdef OBJ_ESTADO
       if (sv.calEstado == 1 || sv.calEstado != estadoMostrado || DIAG_FC) {
@@ -888,10 +1085,12 @@ void setup() {
   colaSpo2     = xQueueCreate(4,   sizeof(DatosSpO2));
   buzonSignos  = xQueueCreate(1,   sizeof(SignosVitales));
   colaCal      = xQueueCreate(1,   sizeof(CmdCal));
-  assert(colaMuestras && colaGrafica && colaSpo2 && buzonSignos && colaCal);
+  mtxSerial    = xSemaphoreCreateMutex();
+  assert(colaMuestras && colaGrafica && colaSpo2 && buzonSignos && colaCal && mtxSerial);
 
   xTaskCreatePinnedToCore(tareaAdquisicion,   "Adquisicion",   4096, NULL, 5, NULL, 1);
   xTaskCreatePinnedToCore(tareaProcesamiento, "Procesamiento", 8192, NULL, 4, NULL, 1);
+  xTaskCreatePinnedToCore(tareaAlarmas,       "Alarmas",       3072, NULL, 3, NULL, 0);  // sobre la UI
   xTaskCreatePinnedToCore(tareaDisplay,       "NextionUI",     4096, NULL, 2, NULL, 0);
 
   afe.enableCapture();
