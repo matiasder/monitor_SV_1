@@ -797,7 +797,8 @@ static void notificarEstado(const char *txt) {
 
 // =========================================================================
 // Alarmas de FC (ver CLAUDE.md)
-//  - Niveles: normal 50-120, aviso <50 o >120, peligro <40 o >140 lpm.
+//  - Niveles con limites ajustables desde page2 (ver ACTUALIZACION_LIMITES.md);
+//    predeterminados: normal 50-120, aviso <50 o >120, peligro <40 o >140 lpm.
 //  - Histeresis de 2 lpm para salir de un nivel y 3 s fuera de rango antes
 //    de subir de nivel. Bajar de nivel es inmediato.
 //  - FC = 0 (sin ECG / electrodos sueltos) se trata como "sin dato": no alarma.
@@ -808,10 +809,18 @@ static void notificarEstado(const char *txt) {
 //  - Una alarma nueva o de mayor prioridad, o volver a normal, quita el silencio.
 // =========================================================================
 #define PIN_BUZZER         25      // buzzer activo: HIGH = suena
+// Limites predeterminados: fijos en el firmware, solo se cambian recompilando
+// (IEC 60601-1-8 6.5.4). El boton Restaurar de page2 vuelve a estos valores.
 #define FC_AVISO_BAJA      50
 #define FC_AVISO_ALTA      120
 #define FC_PELIGRO_BAJA    40
 #define FC_PELIGRO_ALTA    140
+// Rangos y separacion que se aceptan desde la pantalla (sliders h0..h3)
+#define LIM_BAJO_MIN       20      // h0, h2
+#define LIM_BAJO_MAX       100
+#define LIM_ALTO_MIN       90      // h1, h3
+#define LIM_ALTO_MAX       250
+#define LIM_SEPARACION     5       // h2 < h0 < h1 < h3 con al menos 5 lpm
 #define ALARMA_HIST        2       // lpm
 #define ALARMA_RETARDO_MS  3000
 #define ALARMA_TICK_MS     10
@@ -834,13 +843,68 @@ static const PatronAlarma PATRON[3] = {
   { 250, 250, 10, 100, 100, 2000, COLOR_PELIGRO },   // peligro: 2 Hz, 10 pulsos rapidos
 };
 
+// Limites vigentes. Los escribe el lector del serial (tarea de pantalla) y los
+// lee la tarea de alarmas: se copian completos bajo un spinlock.
+struct LimitesFC {
+  uint8_t avisoBajo, avisoAlto, peligroBajo, peligroAlto;
+};
+static LimitesFC limites = { FC_AVISO_BAJA, FC_AVISO_ALTA, FC_PELIGRO_BAJA, FC_PELIGRO_ALTA };
+static portMUX_TYPE muxLimites = portMUX_INITIALIZER_UNLOCKED;
+
+static LimitesFC leerLimites() {
+  portENTER_CRITICAL(&muxLimites);
+  LimitesFC l = limites;
+  portEXIT_CRITICAL(&muxLimites);
+  return l;
+}
+
+static void escribirLimites(const LimitesFC &l) {
+  portENTER_CRITICAL(&muxLimites);
+  limites = l;
+  portEXIT_CRITICAL(&muxLimites);
+}
+
+// Rangos de cada slider y orden h2 < h0 < h1 < h3 con la separacion minima
+static bool limitesValidos(const LimitesFC &l) {
+  if (l.avisoBajo   < LIM_BAJO_MIN || l.avisoBajo   > LIM_BAJO_MAX) return false;
+  if (l.peligroBajo < LIM_BAJO_MIN || l.peligroBajo > LIM_BAJO_MAX) return false;
+  if (l.avisoAlto   < LIM_ALTO_MIN || l.avisoAlto   > LIM_ALTO_MAX) return false;
+  if (l.peligroAlto < LIM_ALTO_MIN || l.peligroAlto > LIM_ALTO_MAX) return false;
+  if (l.avisoBajo - l.peligroBajo < LIM_SEPARACION) return false;
+  if (l.avisoAlto - l.avisoBajo   < LIM_SEPARACION) return false;
+  if (l.peligroAlto - l.avisoAlto < LIM_SEPARACION) return false;
+  return true;
+}
+
+// Escribe en los sliders de page2 los limites vigentes
+static void enviarLimitesPantalla() {
+  LimitesFC l = leerLimites();
+  char cmd[24];
+  snprintf(cmd, sizeof(cmd), "page2.h0.val=%u", (unsigned)l.avisoBajo);   nexCmd(cmd);
+  snprintf(cmd, sizeof(cmd), "page2.h1.val=%u", (unsigned)l.avisoAlto);   nexCmd(cmd);
+  snprintf(cmd, sizeof(cmd), "page2.h2.val=%u", (unsigned)l.peligroBajo); nexCmd(cmd);
+  snprintf(cmd, sizeof(cmd), "page2.h3.val=%u", (unsigned)l.peligroAlto); nexCmd(cmd);
+}
+
+// Mensaje de Guardar/Restaurar: 0x55, aviso_bajo, aviso_alto, peligro_bajo, peligro_alto.
+// Valido -> se aplica (la tarea de alarmas reevalua en su siguiente tick, con la
+// misma histeresis y retardo). Invalido -> se ignora y se reenvian los vigentes.
+static void recibirLimites(const uint8_t *v) {
+  LimitesFC l = { v[0], v[1], v[2], v[3] };
+  if (limitesValidos(l)) {
+    escribirLimites(l);
+  } else {
+    enviarLimitesPantalla();
+  }
+}
+
 // Nivel que corresponde a la FC; para salir del nivel actual hay que entrar
 // ALARMA_HIST lpm dentro del rango (histeresis)
-static uint8_t nivelPara(int fc, uint8_t actual) {
+static uint8_t nivelPara(int fc, uint8_t actual, const LimitesFC &l) {
   int hP = (actual >= NIVEL_PELIGRO) ? ALARMA_HIST : 0;
   int hA = (actual >= NIVEL_AVISO)   ? ALARMA_HIST : 0;
-  if (fc < FC_PELIGRO_BAJA + hP || fc > FC_PELIGRO_ALTA - hP) return NIVEL_PELIGRO;
-  if (fc < FC_AVISO_BAJA   + hA || fc > FC_AVISO_ALTA   - hA) return NIVEL_AVISO;
+  if (fc < l.peligroBajo + hP || fc > l.peligroAlto - hP) return NIVEL_PELIGRO;
+  if (fc < l.avisoBajo   + hA || fc > l.avisoAlto   - hA) return NIVEL_AVISO;
   return NIVEL_NORMAL;
 }
 
@@ -876,7 +940,8 @@ void tareaAlarmas(void *pvParameters) {
 
     // 1. Nivel objetivo segun la FC
     int fc = fcAlarma;
-    uint8_t objetivo = (fc > 0) ? nivelPara(fc, nivel) : NIVEL_NORMAL;
+    LimitesFC lim = leerLimites();              // los vigentes; cambian solo con un mensaje valido
+    uint8_t objetivo = (fc > 0) ? nivelPara(fc, nivel, lim) : NIVEL_NORMAL;
     uint8_t nuevo = nivel;
     if (objetivo > nivel) {                     // subir: solo tras 3 s fuera de rango
       if (!esperando) { esperando = true; tEspera = ahora; nivelEspera = objetivo; }
@@ -951,9 +1016,12 @@ static void procesarLineaNextion(const char *linea) {
 // Lee lo que manda la Nextion sin bloquear:
 //  - lineas ASCII terminadas en '\n' (calibracion "BP:<sbp>/<dbp>"),
 //  - el byte de bt1 (prints bt1.val,1): 0x00 = alarma activa, 0x01 = silenciada,
+//  - limites de page2: 0x55 + 4 bytes (20..250 lpm, nunca 0x00/0x01/0xFF),
 //  - codigos de retorno / eventos de la Nextion (terminan en FF FF FF): se ignoran.
 // Un 0x00/0x01 solo se toma como bt1 si llega SOLO (sin otro byte en 20 ms);
 // si lo sigue otro byte, era parte de una trama de la Nextion (p. ej. 01 FF FF FF).
+#define LIM_TIMEOUT_MS 100   // mensaje de limites incompleto: se descarta
+
 static void leerComandosNextion() {
   static char linea[32];
   static uint8_t n = 0;
@@ -961,10 +1029,32 @@ static void leerComandosNextion() {
   static bool     bt1Pend = false;
   static uint8_t  bt1Val = 0;
   static uint32_t bt1T = 0;
+  static int8_t   limN = -1;              // -1 = sin mensaje; 0..3 = bytes recibidos
+  static uint8_t  limBuf[4];
+  static uint32_t limT = 0;
 
   while (Serial.available()) {
     uint8_t b = (uint8_t)Serial.read();
     bt1Pend = false;                      // llego otro byte enseguida: no era bt1
+
+    // ---- Mensaje de limites en curso ----
+    if (limN >= 0 && (millis() - limT) > LIM_TIMEOUT_MS) {
+      limN = -1;                          // se quedo incompleto: se descarta
+    }
+    if (limN >= 0) {
+      limBuf[limN++] = b;
+      if (limN == 4) {
+        limN = -1;
+        recibirLimites(limBuf);
+      }
+      continue;
+    }
+    if (b == 0x55) {                      // inicio de un mensaje de limites
+      limN = 0;
+      limT = millis();
+      nFF = 0;
+      continue;
+    }
 
     if (b == 0xFF) {
       if (++nFF >= 3) { nFF = 0; n = 0; } // fin de una trama de la Nextion: se descarta
@@ -991,6 +1081,10 @@ static void leerComandosNextion() {
     }
   }
 
+  if (limN >= 0 && (millis() - limT) > LIM_TIMEOUT_MS) {
+    limN = -1;                            // mensaje de limites incompleto: se descarta
+  }
+
   // El byte de bt1 llego solo: se acepta como estado del silencio
   if (bt1Pend && (millis() - bt1T) >= 20) {
     bt1Pend = false;
@@ -1008,6 +1102,10 @@ void tareaDisplay(void *pvParameters) {
   AutoEscala escEcg;
   AutoEscala escPpg;
   int estadoMostrado = -1;
+
+  // Los sliders de page2 arrancan con los limites del firmware
+  vTaskDelay(pdMS_TO_TICKS(500));         // la Nextion termina de encender
+  enviarLimitesPantalla();
 
   for (;;) {
     // Se lee el puerto con nuestro propio parser: NextionListen() consumiria
