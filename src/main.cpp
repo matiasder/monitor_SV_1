@@ -25,7 +25,7 @@ extern "C" {
 #define ALTURA_WAVE  200
 
 // Componente de texto del HMI donde se muestra el estado de la calibracion
-// ("Sin calibrar", "Calibrando: 12/20", "Calibrado"). Si tu HMI no lo tiene,
+// ("Sin calibrar", "Calibrando: 12/30", "Calibrado"). Si tu HMI no lo tiene,
 // comenta esta linea y no se envia nada.
 #define OBJ_ESTADO   "t1"   // IMPORTANTE: en el HMI, subir t1.txt_maxl a 80 o mas
 
@@ -34,7 +34,7 @@ extern "C" {
 #define OBJ_PROGRESO "j0"
 
 // 1 = mientras calibra, el texto de estado muestra contadores de diagnostico
-//     (por que se descartan los latidos). 0 = solo "Calibrando n/20".
+//     (por que se descartan los latidos). 0 = solo "Calibrando n/30".
 #define DIAG_CAL     0
 
 // 1 = cuando no se calibra, el texto de estado muestra cada segundo el
@@ -137,7 +137,7 @@ volatile bool calibrando = false, calibrado = false;
 float SBPO = 120, DBPO = 80, PTTO = 0, PIRO = 0;
 float sumPtt = 0, sumPir = 0;
 int nCal = 0;
-const int N_CAL = 20;
+const int N_CAL = 30;
 
 // Diagnostico de la calibracion: latidos descartados por motivo
 volatile uint16_t dgR = 0;      // picos R detectados por Pan-Tompkins
@@ -177,6 +177,7 @@ void revisarYPromediar(float ptt, float pir);
 void calcularPA(float ptt, float pir, SignosVitales &sv);
 void actualizarSpO2(const DatosSpO2 &d);
 void iniciarCalibracion(float sbp, float dbp);
+void anularCalibracion();
 
 // =========================================================================
 // Utilidades de muestreo y filtrado
@@ -388,6 +389,8 @@ struct DetectorPulso {
 DetectorPulso dp;
 
 volatile uint8_t estadoAFE = 0;   // estado de la senal segun el AFE: 0 sin dedo, 1 estabilizando, 2 valida
+#define SIN_DEDO_S 3              // segundos seguidos con estado 0 para confirmar que se quito el dedo
+volatile bool sinDedo = true;     // dedo retirado (confirmado); al arrancar no hay dedo
 
 void dpReset() {
   memset(&dp, 0, sizeof(dp));
@@ -581,14 +584,23 @@ float fcBpm(uint32_t idxAhora) {
 // SpO2
 // =========================================================================
 void actualizarSpO2(const DatosSpO2 &d) {
-  // Estado del dedo segun el AFE; al quitarlo se reinician los detectores de pulso
-  static uint8_t estadoPrev = 255;
+  // Estado del dedo segun el AFE (llega 1 vez por segundo). Un "sin dedo" suelto
+  // (movimiento) se ignora: solo cuenta si se repite SIN_DEDO_S segundos seguidos.
+  // Entonces se reinician los detectores de pulso y se anula la calibracion.
+  static uint8_t ceros = 0;
   estadoAFE = d.estado;
-  if (d.estado == 0 && estadoPrev != 0) {
-    dpReset();
-    ppg_init(&ppgDet, FS_SISTEMA);
+  if (d.estado == 0) {
+    if (ceros < 255) ceros++;
+    if (ceros == SIN_DEDO_S) {
+      sinDedo = true;
+      dpReset();
+      ppg_init(&ppgDet, FS_SISTEMA);
+      anularCalibracion();     // sin dedo: PANI a 0/0, hay que volver a calibrar
+    }
+  } else {
+    ceros = 0;
+    sinDedo = false;
   }
-  estadoPrev = d.estado;
 
   if (d.estado != 2 || d.acIr == 0 || d.dcIr == 0 || d.acRed == 0 || d.dcRed == 0) {
     nSpo2 = 0; iSpo2 = 0; spo2Prom = 0;
@@ -670,7 +682,7 @@ void tareaProcesamiento(void *pvParameters) {
 #else
       float bpmPPG = ppg_bpm(&ppgDet);
 #endif
-      if (estadoAFE == 0) bpmPPG = 0.0f;      // sin dedo: FP en 0
+      if (sinDedo) bpmPPG = 0.0f;             // sin dedo (confirmado): FP en 0
 
       sv.fc   = (bpmECG > 0.0f) ? (int)(bpmECG + 0.5f) : 0;
       fcAlarma = sv.fc;                         // la lee tareaAlarmas
@@ -777,7 +789,17 @@ void calcularPA(float ptt, float pir, SignosVitales &sv) {
 // Se lee en la tarea de pantalla (unica tarea que usa Serial) y el comando se
 // pasa a la tarea de procesamiento por colaCal.
 // =========================================================================
+// Al quitar el dedo: se pierde la calibracion (PANI 0/0, "Sin calibrar") y se
+// borra el historial de PTT/PIR, que ya no corresponde a la nueva colocacion.
+// Se ejecuta en tareaProcesamiento.
+void anularCalibracion() {
+  calibrando = false; calibrado = false;
+  sumPtt = 0; sumPir = 0; nCal = 0;
+  nProm = 0; iProm = 0; pttProm = 0; pirProm = 0;
+}
+
 void iniciarCalibracion(float sbp, float dbp) {   // se ejecuta en tareaProcesamiento
+  if (sinDedo) return;            // sin dedo no se puede calibrar
   SBPO = sbp; DBPO = dbp;
   sumPtt = 0; sumPir = 0; nCal = 0;
   calibrado = false; calibrando = true;
