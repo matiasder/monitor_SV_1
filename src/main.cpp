@@ -25,13 +25,17 @@ extern "C" {
 #define ALTURA_WAVE  200
 
 // Componente de texto del HMI donde se muestra el estado de la calibracion
-// ("Sin calibrar", "Calibrando 12/20", "Calibrado"). Si tu HMI no lo tiene,
+// ("Sin calibrar", "Calibrando: 12/20", "Calibrado"). Si tu HMI no lo tiene,
 // comenta esta linea y no se envia nada.
 #define OBJ_ESTADO   "t1"   // IMPORTANTE: en el HMI, subir t1.txt_maxl a 80 o mas
 
+// Barra de progreso (Progress bar) de la calibracion: val 0..100.
+// Comentar si el HMI no la tiene.
+#define OBJ_PROGRESO "j0"
+
 // 1 = mientras calibra, el texto de estado muestra contadores de diagnostico
 //     (por que se descartan los latidos). 0 = solo "Calibrando n/20".
-#define DIAG_CAL     1
+#define DIAG_CAL     0
 
 // 1 = cuando no se calibra, el texto de estado muestra cada segundo el
 //     diagnostico de la FC (latidos propuestos, aceptados y descartados)
@@ -452,9 +456,11 @@ float dpBpm(uint32_t idxAhora) {
 //  - a Pan-Tompkins le llega el ECG sin 60 Hz (notch, ver tareaProcesamiento),
 //  - cada latido se ubica en el pico |ECG| y su amplitud se compara con la
 //    del latido mas alto reciente: la onda T y el ruido son mas bajos,
-//  - el intervalo RR debe estar entre 300 y 2000 ms y no ser menor al 70 %
-//    de la mediana. Un latido "de mas" entre dos R se ignora sin mover la
-//    referencia, asi el RR siguiente se mide bien,
+//  - el intervalo RR debe estar entre 300 y 2000 ms. No se exige parecerse a
+//    la mediana: asi la FC sigue los cambios bruscos de ritmo (45 -> 120 lpm);
+//    un latido extra suelto casi no mueve la mediana de 8,
+//  - despues de un latido descartado, el siguiente aceptado solo pasa a ser la
+//    referencia (sin RR): medir desde el R de antes daria un RR doble,
 //  - FC = 60000 / mediana de los ultimos 8 RR; vuelve a 0 sin latidos en 3 s,
 //  - con varios rechazos seguidos (cambio de ritmo o de electrodos) se
 //    reinicia el aprendizaje.
@@ -464,7 +470,6 @@ float dpBpm(uint32_t idxAhora) {
 #define FC_N            8        // latidos en el historial
 #define FC_RR_MIN_MS    300.0f   // 200 lpm
 #define FC_RR_MAX_MS    2000.0f  // 30 lpm
-#define FC_FRAC_RR      0.7f     // RR minimo relativo a la mediana
 #define FC_FRAC_AMP     0.5f     // amplitud minima relativa al latido mas alto reciente
 #define FC_TIMEOUT_MS   3000.0f
 #define FC_MAX_RECHAZOS 4
@@ -537,18 +542,16 @@ void fcLatido(uint32_t idxQrs) {
     return;
   }
   float rr = (float)(R - fcDet.idxUlt) * 1000.0f / FS_SISTEMA;
-  if (rr > FC_RR_MAX_MS) {                     // pausa larga: nueva referencia
+  if (rr < FC_RR_MIN_MS) { dgFcRR++; fcRechazar(); return; }   // latido de mas: no mueve la referencia
+
+  // Pausa larga, o hubo un descarte desde el ultimo R aceptado (el intervalo
+  // contendria un latido perdido): este R solo pasa a ser la nueva referencia
+  if (rr > FC_RR_MAX_MS || fcDet.rechazos > 0) {
     fcDet.idxUlt = R;
     fcGuardarAmp((float)a);
     fcDet.rechazos = 0;
     return;
   }
-  float rrMin = FC_RR_MIN_MS;
-  if (fcDet.nRR >= 3) {
-    float lim = FC_FRAC_RR * medianaF(fcDet.rr, fcDet.nRR);
-    if (lim > rrMin) rrMin = lim;
-  }
-  if (rr < rrMin) { dgFcRR++; fcRechazar(); return; }    // latido de mas: no mueve la referencia
 
   // 4. Latido aceptado: tambien alimenta el PTT/PIR de la calibracion y la PA
   procesarLatido(fcDet.idxUlt, R);
@@ -876,14 +879,18 @@ static bool limitesValidos(const LimitesFC &l) {
   return true;
 }
 
-// Escribe en los sliders de page2 los limites vigentes
+// Escribe en page2 los limites vigentes: sliders h0..h3 y sus numeros n20..n23
+// (h0/n20 aviso bajo, h1/n21 aviso alto, h2/n22 peligro bajo, h3/n23 peligro alto)
 static void enviarLimitesPantalla() {
   LimitesFC l = leerLimites();
+  const uint8_t v[4] = { l.avisoBajo, l.avisoAlto, l.peligroBajo, l.peligroAlto };
   char cmd[24];
-  snprintf(cmd, sizeof(cmd), "page2.h0.val=%u", (unsigned)l.avisoBajo);   nexCmd(cmd);
-  snprintf(cmd, sizeof(cmd), "page2.h1.val=%u", (unsigned)l.avisoAlto);   nexCmd(cmd);
-  snprintf(cmd, sizeof(cmd), "page2.h2.val=%u", (unsigned)l.peligroBajo); nexCmd(cmd);
-  snprintf(cmd, sizeof(cmd), "page2.h3.val=%u", (unsigned)l.peligroAlto); nexCmd(cmd);
+  for (int i = 0; i < 4; i++) {
+    snprintf(cmd, sizeof(cmd), "page2.h%d.val=%u", i, (unsigned)v[i]);
+    nexCmd(cmd);
+    snprintf(cmd, sizeof(cmd), "page2.n%d.val=%u", 20 + i, (unsigned)v[i]);
+    nexCmd(cmd);
+  }
 }
 
 // Mensaje de Guardar/Restaurar: 0x55, aviso_bajo, aviso_alto, peligro_bajo, peligro_alto.
@@ -1141,7 +1148,7 @@ void tareaDisplay(void *pvParameters) {
                    (unsigned)dgPend, (unsigned)dgPtt, (unsigned)dgPir, (unsigned)dgDev,
                    (double)dgUltPtt, (double)dgUltPir);
 #else
-          snprintf(txt, sizeof(txt), "Calibrando %u/%d", (unsigned)sv.calProgreso, N_CAL);
+          snprintf(txt, sizeof(txt), "Calibrando: %u/%d", (unsigned)sv.calProgreso, N_CAL);
 #endif
         } else {
           const char *est = (sv.calEstado == 2) ? "Calibrado" : "Sin calibrar";
@@ -1158,6 +1165,16 @@ void tareaDisplay(void *pvParameters) {
 #endif
         }
         notificarEstado(txt);
+
+#ifdef OBJ_PROGRESO
+        // Barra de progreso: 0..100 % mientras calibra, 100 al terminar, 0 sin calibrar
+        int pct = (sv.calEstado == 2) ? 100
+                : (sv.calEstado == 1) ? (int)sv.calProgreso * 100 / N_CAL : 0;
+        if (pct > 100) pct = 100;
+        char cmd[24];
+        snprintf(cmd, sizeof(cmd), OBJ_PROGRESO ".val=%d", pct);
+        nexCmd(cmd);
+#endif
       }
 #endif
     }
