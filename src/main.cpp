@@ -17,7 +17,10 @@ extern "C" {
 #define AFE_RST   4
 #define FIFO_RDY 16
 
-// Nextion en Serial (UART0 / USB)
+// Nextion en UART2 (Serial2) con pines propios. El USB (Serial) queda libre.
+#define NexSerial    Serial2
+#define NEX_RX       25     // RX del ESP32  <- TX de la Nextion
+#define NEX_TX       33     // TX del ESP32  -> RX de la Nextion
 #define BAUD_NEXTION 115200
 #define ID_WAVE_ECG  8
 #define ID_WAVE_PPG  7
@@ -108,6 +111,7 @@ struct DatosSpO2 {
 
 struct SignosVitales {
   int fc, fp, spo2, sbp, dbp;
+  int ptt;                // PTT promedio (ms), 0 = sin dato
   bool calibrado;
   uint8_t calEstado;      // 0 = sin calibrar, 1 = calibrando, 2 = calibrado
   uint8_t calProgreso;    // latidos acumulados (0..N_CAL)
@@ -162,7 +166,7 @@ QueueHandle_t colaSpo2;       // Adq -> Proc (1 Hz)
 QueueHandle_t buzonSignos;    // Proc -> Display (mailbox)
 QueueHandle_t colaCal;        // Display -> Proc (comando de calibracion)
 
-EasyNex myNextion(Serial);
+EasyNex myNextion(NexSerial);
 
 // El puerto serie lo usan la tarea de pantalla y la de alarmas: este mutex
 // evita que se mezclen los bytes de sus comandos
@@ -208,24 +212,24 @@ static inline void serialSoltar() {
 // Envia un comando a la Nextion (con los tres 0xFF finales)
 void nexCmd(const char *cmd) {
   if (!serialTomar()) return;
-  Serial.print(cmd);
-  Serial.write(0xFF);
-  Serial.write(0xFF);
-  Serial.write(0xFF);
+  NexSerial.print(cmd);
+  NexSerial.write(0xFF);
+  NexSerial.write(0xFF);
+  NexSerial.write(0xFF);
   serialSoltar();
 }
 
 void agregarPuntoGrafica(int idWave, int canal, int valor) {
   if (!serialTomar()) return;
-  Serial.print("add ");
-  Serial.print(idWave);
-  Serial.print(",");
-  Serial.print(canal);
-  Serial.print(",");
-  Serial.print(valor);
-  Serial.write(0xFF);
-  Serial.write(0xFF);
-  Serial.write(0xFF);
+  NexSerial.print("add ");
+  NexSerial.print(idWave);
+  NexSerial.print(",");
+  NexSerial.print(canal);
+  NexSerial.print(",");
+  NexSerial.print(valor);
+  NexSerial.write(0xFF);
+  NexSerial.write(0xFF);
+  NexSerial.write(0xFF);
   serialSoltar();
 }
 
@@ -641,7 +645,7 @@ void tareaProcesamiento(void *pvParameters) {
 
   MuestraTriada m;
   DatosSpO2 dsp;
-  SignosVitales sv = {0, 0, 0, 0, 0, false};
+  SignosVitales sv = {};
   TickType_t ultActualizacionUI = xTaskGetTickCount();
 
   for (;;) {
@@ -690,6 +694,7 @@ void tareaProcesamiento(void *pvParameters) {
       sv.spo2 = (nSpo2 > 0) ? (int)(spo2Prom + 0.5f) : 0;
       sv.calEstado   = calibrando ? 1 : (calibrado ? 2 : 0);
       sv.calProgreso = (uint8_t)nCal;
+      sv.ptt = (nProm > 0) ? (int)(pttProm + 0.5f) : 0;
 
       calcularPA(pttProm, pirProm, sv);
       xQueueOverwrite(buzonSignos, &sv);
@@ -786,7 +791,7 @@ void calcularPA(float ptt, float pir, SignosVitales &sv) {
 //
 // La Nextion envia por UART la trama ASCII:   BP:<sbp><separador><dbp>\n
 // (por ejemplo "BP:120/80\n", "BP:120 80\n" o "BP:120,80\n").
-// Se lee en la tarea de pantalla (unica tarea que usa Serial) y el comando se
+// Se lee en la tarea de pantalla (unica tarea que lee NexSerial) y el comando se
 // pasa a la tarea de procesamiento por colaCal.
 // =========================================================================
 // Al quitar el dedo: se pierde la calibracion (PANI 0/0, "Sin calibrar") y se
@@ -810,12 +815,12 @@ void iniciarCalibracion(float sbp, float dbp) {   // se ejecuta en tareaProcesam
 static void notificarEstado(const char *txt) {
 #ifdef OBJ_ESTADO
   if (!serialTomar()) return;
-  Serial.print(OBJ_ESTADO ".txt=\"");
-  Serial.print(txt);
-  Serial.print("\"");
-  Serial.write(0xFF);
-  Serial.write(0xFF);
-  Serial.write(0xFF);
+  NexSerial.print(OBJ_ESTADO ".txt=\"");
+  NexSerial.print(txt);
+  NexSerial.print("\"");
+  NexSerial.write(0xFF);
+  NexSerial.write(0xFF);
+  NexSerial.write(0xFF);
   serialSoltar();
 #endif
 }
@@ -833,7 +838,10 @@ static void notificarEstado(const char *txt) {
 //  - Silenciar (bt1 = 1) solo apaga el buzzer; el margen sigue parpadeando.
 //  - Una alarma nueva o de mayor prioridad, o volver a normal, quita el silencio.
 // =========================================================================
-#define PIN_BUZZER         25      // buzzer activo: HIGH = suena
+#define PIN_BUZZER         12      // buzzer activo: HIGH = suena. GPIO12 es pin de arranque: no debe quedar en HIGH al encender
+#define PIN_LED_VERDE      14      // encendido: siempre prendido (no es alarma)
+#define PIN_LED_AMBAR      27      // aviso: parpadea con el margen ambar
+#define PIN_LED_ROJO       26      // peligro: parpadea con el margen rojo
 // Limites predeterminados: fijos en el firmware, solo se cambian recompilando
 // (IEC 60601-1-8 6.5.4). El boton Restaurar de page2 vuelve a estos valores.
 #define FC_AVISO_BAJA      50
@@ -951,9 +959,21 @@ static void enviarColorMargen(uint16_t color) {
   }
 }
 
+// LED de la alarma del nivel: parpadea junto con el margen (mismo temporizador).
+// El silencio no los apaga: igual que el margen, solo se silencia el buzzer.
+static void ledsAlarma(uint8_t nivel, bool on) {
+  digitalWrite(PIN_LED_AMBAR, (on && nivel == NIVEL_AVISO)   ? HIGH : LOW);
+  digitalWrite(PIN_LED_ROJO,  (on && nivel == NIVEL_PELIGRO) ? HIGH : LOW);
+}
+
 void tareaAlarmas(void *pvParameters) {
   pinMode(PIN_BUZZER, OUTPUT);
   digitalWrite(PIN_BUZZER, LOW);
+  pinMode(PIN_LED_VERDE, OUTPUT);
+  pinMode(PIN_LED_AMBAR, OUTPUT);
+  pinMode(PIN_LED_ROJO,  OUTPUT);
+  digitalWrite(PIN_LED_VERDE, HIGH);        // equipo encendido: siempre prendido
+  ledsAlarma(NIVEL_NORMAL, false);
 
   uint8_t  nivel = NIVEL_NORMAL;
   bool     esperando = false;       // FC fuera de rango, contando el retardo
@@ -989,11 +1009,13 @@ void tareaAlarmas(void *pvParameters) {
       if (nivel == NIVEL_NORMAL) {
         buzzerOn = false;
         digitalWrite(PIN_BUZZER, LOW);
+        ledsAlarma(NIVEL_NORMAL, false);
         margenOn = false;
         nexCmd("click m0,0");
         quitarSilencio();
       } else {
         if (sube) quitarSilencio();             // alarma nueva o de mayor prioridad
+        ledsAlarma(nivel, false);               // apaga el LED del nivel anterior
         enviarColorMargen(PATRON[nivel].color);
         margenOn = false;
         nexCmd("click m0,0");                   // el parpadeo arranca limpio con el color nuevo
@@ -1017,6 +1039,7 @@ void tareaAlarmas(void *pvParameters) {
     bool mOn = (dt % ((uint32_t)p.margenOnMs + p.margenOffMs)) < p.margenOnMs;
     if (mOn != margenOn) {
       margenOn = mOn;
+      ledsAlarma(nivel, mOn);                   // LED antes que la pantalla: no depende de ella
       nexCmd(mOn ? "click m0,1" : "click m0,0");
     }
   }
@@ -1062,8 +1085,8 @@ static void leerComandosNextion() {
   static uint8_t  limBuf[4];
   static uint32_t limT = 0;
 
-  while (Serial.available()) {
-    uint8_t b = (uint8_t)Serial.read();
+  while (NexSerial.available()) {
+    uint8_t b = (uint8_t)NexSerial.read();
     bt1Pend = false;                      // llego otro byte enseguida: no era bt1
 
     // ---- Mensaje de limites en curso ----
@@ -1156,6 +1179,7 @@ void tareaDisplay(void *pvParameters) {
         myNextion.writeNum("n2.val", sv.fp);
         myNextion.writeNum("n3.val", sv.sbp);
         myNextion.writeNum("n4.val", sv.dbp);
+        myNextion.writeNum("n36.val", sv.ptt);   // PTT (ms)
         serialSoltar();
       }
 
@@ -1209,7 +1233,8 @@ void tareaDisplay(void *pvParameters) {
 // Setup & Loop
 // =========================================================================
 void setup() {
-  Serial.begin(BAUD_NEXTION);
+  Serial.begin(115200);                                           // USB: libre para depurar
+  NexSerial.begin(BAUD_NEXTION, SERIAL_8N1, NEX_RX, NEX_TX);      // Nextion (antes de myNextion.begin: asi conserva estos pines)
   myNextion.begin(BAUD_NEXTION);
 
   while (!afe.configure(SCLK, MISO, MOSI, CS, AFE_RST, FIFO_RDY)) {
