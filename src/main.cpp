@@ -694,7 +694,8 @@ void tareaProcesamiento(void *pvParameters) {
       sv.spo2 = (nSpo2 > 0) ? (int)(spo2Prom + 0.5f) : 0;
       sv.calEstado   = calibrando ? 1 : (calibrado ? 2 : 0);
       sv.calProgreso = (uint8_t)nCal;
-      sv.ptt = (nProm > 0) ? (int)(pttProm + 0.5f) : 0;
+      // Sin pulso en la PPG (FP = 0) el PTT no tiene sentido: se muestra 0
+      sv.ptt = (nProm > 0 && sv.fp > 0) ? (int)(pttProm + 0.5f) : 0;
 
       calcularPA(pttProm, pirProm, sv);
       xQueueOverwrite(buzonSignos, &sv);
