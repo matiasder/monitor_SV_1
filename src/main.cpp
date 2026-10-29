@@ -139,6 +139,7 @@ float pttProm = 0, pirProm = 0;
 
 volatile bool calibrando = false, calibrado = false;
 float SBPO = 120, DBPO = 80, PTTO = 0, PIRO = 0;
+float sbpNueva = 120, dbpNueva = 80;   // valores de la calibracion en curso (se aplican al terminar)
 float sumPtt = 0, sumPir = 0;
 int nCal = 0;
 const int N_CAL = 30;
@@ -181,7 +182,7 @@ void revisarYPromediar(float ptt, float pir);
 void calcularPA(float ptt, float pir, SignosVitales &sv);
 void actualizarSpO2(const DatosSpO2 &d);
 void iniciarCalibracion(float sbp, float dbp);
-void anularCalibracion();
+void dedoRetirado();
 
 // =========================================================================
 // Utilidades de muestreo y filtrado
@@ -599,7 +600,7 @@ void actualizarSpO2(const DatosSpO2 &d) {
       sinDedo = true;
       dpReset();
       ppg_init(&ppgDet, FS_SISTEMA);
-      anularCalibracion();     // sin dedo: PANI a 0/0, hay que volver a calibrar
+      dedoRetirado();          // se cancela una calibracion en curso; la vigente se conserva
     }
   } else {
     ceros = 0;
@@ -747,10 +748,25 @@ void procesarLatido(uint32_t R, uint32_t Rsig) {
 }
 
 void revisarYPromediar(float ptt, float pir) {
+  static uint8_t desvSeguidas = 0;
+
+  if (estadoAFE != 2) return;                  // senal del AFE aun no valida
   if (ptt < 150 || ptt > 450) { dgPtt++; return; }
   if (USAR_PIR && (pir <= 1.0f || pir > 1.3f)) { dgPir++; return; }
 
-  if (nProm == NPROM && fabsf(ptt - pttProm) > 0.2f * pttProm) { dgDev++; return; }
+  // Desviacion > 20 % del promedio: se descarta. Cinco seguidas no son ruido
+  // suelto (el ruido se alterna con latidos buenos) sino un cambio real del
+  // PTT: el historial se rehace para no quedar bloqueado.
+  if (nProm == NPROM && fabsf(ptt - pttProm) > 0.2f * pttProm) {
+    dgDev++;
+    if (++desvSeguidas >= 5) {
+      desvSeguidas = 0;
+      nProm = 0; iProm = 0;
+      if (calibrando) { sumPtt = 0; sumPir = 0; nCal = 0; }   // no mezclar dos colocaciones
+    }
+    return;
+  }
+  desvSeguidas = 0;
 
   hPtt[iProm] = ptt;
   hPir[iProm] = pir;
@@ -765,6 +781,7 @@ void revisarYPromediar(float ptt, float pir) {
   if (calibrando) {
     sumPtt += ptt; sumPir += pir; nCal++;
     if (nCal >= N_CAL) {
+      SBPO = sbpNueva; DBPO = dbpNueva;          // la calibracion nueva reemplaza a la anterior
       PTTO = sumPtt / nCal;
       PIRO = sumPir / nCal;
       calibrando = false; calibrado = true;
@@ -774,7 +791,9 @@ void revisarYPromediar(float ptt, float pir) {
 
 void calcularPA(float ptt, float pir, SignosVitales &sv) {
   sv.calibrado = calibrado;
-  if (!calibrado || ptt == 0) { sv.sbp = 0; sv.dbp = 0; return; }
+  // Sin pulso en la PPG (FP = 0, p. ej. dedo retirado) la PANI se muestra 0/0;
+  // la calibracion se conserva y se retoma al volver el pulso
+  if (!calibrado || ptt == 0 || sv.fp == 0) { sv.sbp = 0; sv.dbp = 0; return; }
 
   float PPO  = SBPO - DBPO;
   float MBPO = DBPO + PPO / 3.0f;
@@ -798,17 +817,22 @@ void calcularPA(float ptt, float pir, SignosVitales &sv) {
 // Al quitar el dedo: se pierde la calibracion (PANI 0/0, "Sin calibrar") y se
 // borra el historial de PTT/PIR, que ya no corresponde a la nueva colocacion.
 // Se ejecuta en tareaProcesamiento.
-void anularCalibracion() {
-  calibrando = false; calibrado = false;
+// Al retirar el dedo: la calibracion vigente (SBPO/DBPO/PTTO/PIRO) NO se pierde.
+// Se cancela una calibracion en curso y se borra el historial de PTT/PIR, que
+// se rehace con la nueva colocacion. Se ejecuta en tareaProcesamiento.
+void dedoRetirado() {
+  calibrando = false;
   sumPtt = 0; sumPir = 0; nCal = 0;
   nProm = 0; iProm = 0; pttProm = 0; pirProm = 0;
 }
 
 void iniciarCalibracion(float sbp, float dbp) {   // se ejecuta en tareaProcesamiento
   if (sinDedo) return;            // sin dedo no se puede calibrar
-  SBPO = sbp; DBPO = dbp;
+  sbpNueva = sbp; dbpNueva = dbp;     // se aplican al terminar; mientras, sigue la calibracion vigente
   sumPtt = 0; sumPir = 0; nCal = 0;
-  calibrado = false; calibrando = true;
+  nProm = 0; iProm = 0; pttProm = 0; pirProm = 0;   // historial nuevo para esta colocacion
+  dgR = dgRR = dgPend = dgPtt = dgPir = dgDev = 0;   // diagnostico desde cero
+  calibrando = true;
 }
 
 // Texto de estado en la Nextion (solo desde tareaDisplay, para no mezclar
@@ -1055,6 +1079,10 @@ static void procesarLineaNextion(const char *linea) {
     return;
   }
 
+  if (sinDedo) {                          // avisar en vez de ignorar el comando
+    notificarEstado("Coloque el dedo y espere");
+    return;
+  }
   CmdCal cmd = { (float)sbp, (float)dbp };
   xQueueOverwrite(colaCal, &cmd);         // la tarea de procesamiento la recoge
 }
