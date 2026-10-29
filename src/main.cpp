@@ -836,7 +836,8 @@ static void notificarEstado(const char *txt) {
 //    margen (click m0,1 / click m0,0). El buzzer se actualiza ANTES de escribir
 //    en la pantalla y no depende de que la Nextion responda.
 //  - Silenciar (bt1 = 1) solo apaga el buzzer; el margen sigue parpadeando.
-//  - Una alarma nueva o de mayor prioridad, o volver a normal, quita el silencio.
+//  - El silencio solo lo cambia bt1: una alarma nueva, de mayor prioridad o
+//    volver a normal NO lo quitan.
 // =========================================================================
 #define PIN_BUZZER         12      // buzzer activo: HIGH = suena. GPIO12 es pin de arranque: no debe quedar en HIGH al encender
 #define PIN_LED_VERDE      14      // encendido: siempre prendido (no es alarma)
@@ -945,12 +946,6 @@ static uint8_t nivelPara(int fc, uint8_t actual, const LimitesFC &l) {
   return NIVEL_NORMAL;
 }
 
-static void quitarSilencio() {
-  silenciado = false;
-  nexCmd("bt1.val=0");
-  nexCmd("page0.silencio0.val=0");
-}
-
 static void enviarColorMargen(uint16_t color) {
   char cmd[20];
   for (int i = 20; i <= 23; i++) {
@@ -1003,7 +998,6 @@ void tareaAlarmas(void *pvParameters) {
 
     // 2. Cambio de nivel
     if (nuevo != nivel) {
-      bool sube = nuevo > nivel;
       nivel = nuevo;
       t0 = ahora;
       if (nivel == NIVEL_NORMAL) {
@@ -1012,9 +1006,8 @@ void tareaAlarmas(void *pvParameters) {
         ledsAlarma(NIVEL_NORMAL, false);
         margenOn = false;
         nexCmd("click m0,0");
-        quitarSilencio();
       } else {
-        if (sube) quitarSilencio();             // alarma nueva o de mayor prioridad
+        // El silencio lo maneja SOLO bt1: una alarma nueva o de mayor prioridad no lo quita
         ledsAlarma(nivel, false);               // apaga el LED del nivel anterior
         enviarColorMargen(PATRON[nivel].color);
         margenOn = false;
