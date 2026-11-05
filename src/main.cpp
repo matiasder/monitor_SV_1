@@ -77,7 +77,7 @@ extern "C" {
 // Varias etapas iguales en cascada -> rechazo mas profundo y mas ancho
 // (tolera que la red se corra de 60 Hz). Q mas bajo = notch mas ancho.
 #define ECG_RED_HZ        60.0f
-#define ECG_NOTCH_Q       2.0f   // ancho ~15 Hz por etapa (antes 10 -> ~6 Hz)
+#define ECG_NOTCH_Q       2.0f   // ancho ~30 Hz por etapa (Q = 60 Hz / ancho)
 #define ECG_NOTCH_ETAPAS  2      // etapas a 60 Hz (1..BIO_MAX_STAGES)
 #define ECG_NOTCH_120     1      // 1 = notch extra en el armonico de 120 Hz
 #define ECG_NOTCH_120_Q   2.0f
