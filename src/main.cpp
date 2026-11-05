@@ -70,6 +70,16 @@ extern "C" {
 #define DIV_GRAFICA 1         // 1 = dibuja cada ciclo (250 Hz) (2 @ 500 Hz)
 #define PPG_SIGN   (+1.0f)    // +1.0f o -1.0f segun la polaridad del sensor
 
+// Notch de red para el ECG (se aplica antes de todo: grafica, buffers y FC)
+// Varias etapas iguales en cascada -> rechazo mas profundo y mas ancho
+// (tolera que la red se corra de 60 Hz). Q mas bajo = notch mas ancho.
+#define ECG_RED_HZ        60.0f
+#define ECG_NOTCH_Q       2.0f   // ancho ~15 Hz por etapa (antes 10 -> ~6 Hz)
+#define ECG_NOTCH_ETAPAS  2      // etapas a 60 Hz (1..BIO_MAX_STAGES)
+#define ECG_NOTCH_120     1      // 1 = notch extra en el armonico de 120 Hz
+#define ECG_NOTCH_120_Q   2.0f
+#define PPG_NOTCH         1      // 1 = mismo notch (60 + 120 Hz) tambien en la PPG
+
 // SpO2 = A - B*R
 #define SPO2_A       110.0f
 #define SPO2_B       25.0f
@@ -253,8 +263,30 @@ static void emitirMuestra(float ecgProm, int32_t ppgRaw) {
   static float ecgBase = 0, ppgBase = 0;
   static float lpfEcg = 0, lpfPpg = 0;
   static bool baseInit = false;
+  static Biquad notchEcg[ECG_NOTCH_ETAPAS];
+#if ECG_NOTCH_120
+  static Biquad notchEcg120;
+#endif
+#if PPG_NOTCH
+  static Biquad notchPpg[ECG_NOTCH_ETAPAS];
+#if ECG_NOTCH_120
+  static Biquad notchPpg120;
+#endif
+#endif
 
   if (!baseInit) {
+    for (int i = 0; i < ECG_NOTCH_ETAPAS; i++)
+      biquad_notch(&notchEcg[i], FS_SISTEMA, ECG_RED_HZ, ECG_NOTCH_Q);
+#if ECG_NOTCH_120
+    biquad_notch(&notchEcg120, FS_SISTEMA, 2.0f * ECG_RED_HZ, ECG_NOTCH_120_Q);
+#endif
+#if PPG_NOTCH
+    for (int i = 0; i < ECG_NOTCH_ETAPAS; i++)
+      biquad_notch(&notchPpg[i], FS_SISTEMA, ECG_RED_HZ, ECG_NOTCH_Q);
+#if ECG_NOTCH_120
+    biquad_notch(&notchPpg120, FS_SISTEMA, 2.0f * ECG_RED_HZ, ECG_NOTCH_120_Q);
+#endif
+#endif
     ecgBase = ecgProm;
     ppgBase = (float)ppgRaw;
     lpfEcg = 0;
@@ -268,6 +300,20 @@ static void emitirMuestra(float ecgProm, int32_t ppgRaw) {
 
   float ecgSinBase = ecgProm - ecgBase;
   float ppgSinBase = ((float)ppgRaw - ppgBase) * PPG_SIGN;
+
+  // Quitar 60 Hz (y 120 Hz) de la red electrica
+  for (int i = 0; i < ECG_NOTCH_ETAPAS; i++)
+    ecgSinBase = biquad_process(&notchEcg[i], ecgSinBase);
+#if ECG_NOTCH_120
+  ecgSinBase = biquad_process(&notchEcg120, ecgSinBase);
+#endif
+#if PPG_NOTCH
+  for (int i = 0; i < ECG_NOTCH_ETAPAS; i++)
+    ppgSinBase = biquad_process(&notchPpg[i], ppgSinBase);
+#if ECG_NOTCH_120
+  ppgSinBase = biquad_process(&notchPpg120, ppgSinBase);
+#endif
+#endif
 
   // 2. Filtrar ruido de alta frecuencia
   MuestraTriada m;
@@ -461,7 +507,7 @@ float dpBpm(uint32_t idxAhora) {
 // =========================================================================
 // Frecuencia cardiaca (FC) a partir del ECG
 // Pan-Tompkins propone latidos; aqui se validan antes de usarlos para la FC:
-//  - a Pan-Tompkins le llega el ECG sin 60 Hz (notch, ver tareaProcesamiento),
+//  - a Pan-Tompkins le llega el ECG sin 60 Hz (notch, ver emitirMuestra),
 //  - cada latido se ubica en el pico |ECG| y su amplitud se compara con la
 //    del latido mas alto reciente: la onda T y el ruido son mas bajos,
 //  - el intervalo RR debe estar entre 300 y 2000 ms. No se exige parecerse a
@@ -473,8 +519,6 @@ float dpBpm(uint32_t idxAhora) {
 //  - con varios rechazos seguidos (cambio de ritmo o de electrodos) se
 //    reinicia el aprendizaje.
 // =========================================================================
-#define FC_FREC_RED     60.0f    // red electrica (Colombia)
-#define FC_NOTCH_Q      10.0f
 #define FC_N            8        // latidos en el historial
 #define FC_RR_MIN_MS    300.0f   // 200 lpm
 #define FC_RR_MAX_MS    2000.0f  // 30 lpm
@@ -640,10 +684,6 @@ void tareaProcesamiento(void *pvParameters) {
   dpReset();
   fcReset();
 
-  // Notch de 60 Hz solo para la entrada de Pan-Tompkins (la grafica no cambia)
-  static Biquad notchFc;
-  biquad_notch(&notchFc, FS_SISTEMA, FC_FREC_RED, FC_NOTCH_Q);
-
   MuestraTriada m;
   DatosSpO2 dsp;
   SignosVitales sv = {};
@@ -651,7 +691,7 @@ void tareaProcesamiento(void *pvParameters) {
 
   for (;;) {
     if (xQueueReceive(colaMuestras, &m, pdMS_TO_TICKS(50)) == pdTRUE) {
-      PT_Result r = pt_process(&pt, biquad_process(&notchFc, m.ecg));
+      PT_Result r = pt_process(&pt, m.ecg);   // m.ecg ya viene sin 60 Hz (emitirMuestra)
       if (r.beat) {
         dgR++;
         // Muestra del QRS segun Pan-Tompkins (en la busqueda hacia atras es
@@ -1169,6 +1209,11 @@ static void leerComandosNextion() {
 // =========================================================================
 // Tarea 3: Nextion UI (Core 0, prio 2)
 // =========================================================================
+// Pantalla de inicio (la imagen va en una pagina de la Nextion, ver PAGINA_LOGO)
+#define PAGINA_LOGO       "logo"    // nombre de la pagina con el logo en el HMI
+#define PAGINA_PRINCIPAL  "page0"   // nombre de la pagina con las graficas
+#define LOGO_MS           2000      // tiempo que se muestra el logo
+
 void tareaDisplay(void *pvParameters) {
   MuestraTriada m;
   SignosVitales sv;
@@ -1177,8 +1222,15 @@ void tareaDisplay(void *pvParameters) {
   AutoEscala escPpg;
   int estadoMostrado = -1;
 
-  // Los sliders de page2 arrancan con los limites del firmware
+  // Logo de arranque: se muestra LOGO_MS y luego se pasa a la pagina principal
   vTaskDelay(pdMS_TO_TICKS(500));         // la Nextion termina de encender
+  nexCmd("page " PAGINA_LOGO);
+  vTaskDelay(pdMS_TO_TICKS(LOGO_MS));
+  nexCmd("page " PAGINA_PRINCIPAL);
+  xQueueReset(colaGrafica);               // se descartan las muestras acumuladas durante el logo
+  vTaskDelay(pdMS_TO_TICKS(100));         // la pagina termina de cargar
+
+  // Los sliders de page2 arrancan con los limites del firmware
   enviarLimitesPantalla();
 
   for (;;) {
