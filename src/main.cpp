@@ -36,6 +36,9 @@ extern "C" {
 // Comentar si el HMI no la tiene.
 #define OBJ_PROGRESO "j0"
 
+// Numero del HMI donde se muestra la temperatura corporal (entero, en °C)
+#define OBJ_TEMP     "n5.val"
+
 // 1 = mientras calibra, el texto de estado muestra contadores de diagnostico
 //     (por que se descartan los latidos). 0 = solo "Calibrando n/30".
 #define DIAG_CAL     0
@@ -1207,6 +1210,89 @@ static void leerComandosNextion() {
 }
 
 // =========================================================================
+// Tarea 5: Temperatura (Core 0, prio 1)
+// Sensor ST1307 (NTC YSI 400) + puente + AD623 -> GPIO13 (mismo calculo que
+// el proyecto "temperatura"). GPIO13 es ADC2: funciona porque no se usa WiFi.
+//  - cada segundo: 40 lecturas cada 5 ms (200 ms = 12 ciclos de 60 Hz, asi el
+//    ruido de la red se cancela al promediar),
+//  - inversion del circuito + Steinhart-Hart,
+//  - sensor abierto / en corto / fuera de rango -> temperatura 0.
+// =========================================================================
+#define PIN_TEMP        13
+
+// Constantes del circuito (poner los valores medidos con el multimetro)
+#define T_VREF          2.440f    // salida del REF3025 [V]
+#define T_VL            1.170f    // salida del buffer MCP6001 [V]
+#define T_RS            12000.0f  // resistencia en serie con el NTC [ohm]
+#define T_R3            12000.0f  // rama de referencia, arriba [ohm]
+#define T_R4            2200.0f   // rama de referencia, abajo [ohm]
+#define T_RG            6200.0f   // resistencia de ganancia del AD623 [ohm]
+#define T_G             (1.0f + 100000.0f / T_RG)
+#define T_VB            (T_VL + (T_VREF - T_VL) * T_R4 / (T_R3 + T_R4))
+
+// Steinhart-Hart, curva nominal YSI 44004
+#define T_SH_A          1.468e-3f
+#define T_SH_B          2.383e-4f
+#define T_SH_C          1.007e-7f
+
+// Correccion lineal de Vout (calibracion con resistencias de precision)
+#define T_CAL_GAIN      1.000f
+#define T_CAL_OFFSET    0.000f    // [V]
+
+#define T_N_MUESTRAS    40        // x 5 ms = 200 ms
+#define T_PASO_MS       5
+#define T_VOUT_MIN      0.25f     // por debajo: NTC abierto / desconectado
+#define T_VOUT_MAX      2.40f     // por encima: NTC en corto
+#define T_MIN           25.0f     // rango del ST1307
+#define T_MAX           45.0f
+#define DEBUG_TEMP      0         // 1 = imprime T, Vout y RT por el USB cada segundo
+
+volatile int tempEntera = 0;      // °C redondeado, 0 = sin dato (la lee tareaDisplay)
+
+static float tempLeerVout() {
+  uint32_t suma = 0;
+  TickType_t t = xTaskGetTickCount();
+  for (int i = 0; i < T_N_MUESTRAS; i++) {
+    suma += analogReadMilliVolts(PIN_TEMP);   // usa la calibracion de fabrica (eFuse)
+    vTaskDelayUntil(&t, pdMS_TO_TICKS(T_PASO_MS));
+  }
+  float vout = (suma / (float)T_N_MUESTRAS) / 1000.0f;
+  return T_CAL_GAIN * vout + T_CAL_OFFSET;
+}
+
+void tareaTemperatura(void *pvParameters) {
+  analogReadResolution(12);
+  analogSetPinAttenuation(PIN_TEMP, ADC_11db);
+
+  TickType_t t = xTaskGetTickCount();
+  for (;;) {
+    float vout = tempLeerVout();
+    float temp = NAN, rt = NAN;
+
+    if (vout >= T_VOUT_MIN && vout <= T_VOUT_MAX) {
+      float vt = T_VB - vout / T_G;                       // puente + AD623
+      rt = T_RS * (vt - T_VL) / (T_VREF - vt);
+      if (rt > 0.0f) {
+        float L = logf(rt);                               // Steinhart-Hart
+        temp = 1.0f / (T_SH_A + T_SH_B * L + T_SH_C * L * L * L) - 273.15f;
+      }
+    }
+
+    bool ok = !isnan(temp) && temp >= T_MIN && temp <= T_MAX;
+    tempEntera = ok ? (int)lroundf(temp) : 0;
+
+#if DEBUG_TEMP
+    Serial.printf("T = %.2f C  Vout = %.4f V  RT = %.1f ohm  %s
+",
+                  (double)temp, (double)vout, (double)rt,
+                  vout < T_VOUT_MIN ? "ABIERTO" : vout > T_VOUT_MAX ? "CORTO" : ok ? "OK" : "FUERA DE RANGO");
+#endif
+
+    vTaskDelayUntil(&t, pdMS_TO_TICKS(1000));            // 1 lectura por segundo
+  }
+}
+
+// =========================================================================
 // Tarea 3: Nextion UI (Core 0, prio 2)
 // =========================================================================
 // Pantalla de inicio (la imagen va en una pagina de la Nextion, ver PAGINA_LOGO)
@@ -1254,6 +1340,7 @@ void tareaDisplay(void *pvParameters) {
         myNextion.writeNum("n3.val", sv.sbp);
         myNextion.writeNum("n4.val", sv.dbp);
         myNextion.writeNum("n36.val", sv.ptt);   // PTT (ms)
+        myNextion.writeNum(OBJ_TEMP, tempEntera); // temperatura (°C, entero)
         serialSoltar();
       }
 
@@ -1328,6 +1415,7 @@ void setup() {
   xTaskCreatePinnedToCore(tareaProcesamiento, "Procesamiento", 8192, NULL, 4, NULL, 1);
   xTaskCreatePinnedToCore(tareaAlarmas,       "Alarmas",       3072, NULL, 3, NULL, 0);  // sobre la UI
   xTaskCreatePinnedToCore(tareaDisplay,       "NextionUI",     4096, NULL, 2, NULL, 0);
+  xTaskCreatePinnedToCore(tareaTemperatura,   "Temperatura",   3072, NULL, 1, NULL, 0);
 
   afe.enableCapture();
 }
